@@ -3,23 +3,21 @@
 #![feature(custom_test_frameworks)]
 #![feature(alloc_error_handler)]
 #![feature(abi_x86_interrupt)]
-#![test_runner(crate::test_runner)]
+#![test_runner(orbita::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 
 extern crate alloc;
 
+extern crate orbita;
+
 use bootloader::{entry_point, BootInfo};
 use core::panic::PanicInfo;
 use x86_64::VirtAddr;
+use orbita::{
+    allocator, gdt, graphics, interrupts, kernel, memory, serial, hlt_loop,
+    serial_println,
+};
 
-mod allocator;
-mod gdt;
-mod graphics;
-mod interrupts;
-mod kernel;
-mod memory;
-mod serial;
-mod vga_buffer;
 
 entry_point!(kernel_main);
 
@@ -55,40 +53,4 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 fn panic(info: &PanicInfo) -> ! {
     serial_println!("Kernel panic: {}", info);
     hlt_loop();
-}
-
-fn hlt_loop() -> ! {
-    loop {
-        x86_64::instructions::hlt();
-    }
-}
-
-#[cfg(test)]
-fn test_runner(tests: &[&dyn Fn()]) {
-    serial_println!("Running {} tests", tests.len());
-    for test in tests {
-        test();
-    }
-    exit_qemu(QemuExitCode::Success);
-}
-
-#[cfg(test)]
-use crate::serial_println;
-
-#[cfg(test)]
-fn exit_qemu(exit_code: QemuExitCode) {
-    use x86_64::instructions::port::Port;
-
-    unsafe {
-        let mut port = Port::new(0xf4);
-        port.write(exit_code as u32);
-    }
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum QemuExitCode {
-    Success = 0x10,
-    Failed = 0x11,
 }
