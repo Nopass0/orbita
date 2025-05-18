@@ -272,7 +272,7 @@ pub fn disable_cursor() {
 //! Provides pixel-based graphics capabilities
 
 use core::slice;
-use multiboot2::FramebufferTag;
+use bootloader::{BootInfo, framebuffer::Framebuffer};
 use spin::Mutex;
 
 /// Pixel color representation
@@ -323,17 +323,17 @@ pub struct Graphics {
 }
 
 impl Graphics {
-    /// Create a new graphics instance from multiboot framebuffer tag
-    pub fn new(framebuffer: &'static FramebufferTag) -> Self {
+    /// Create a new graphics instance from the bootloader framebuffer
+    pub fn new(framebuffer: &'static mut Framebuffer) -> Self {
         let info = FramebufferInfo {
-            width: framebuffer.width(),
-            height: framebuffer.height(),
-            pitch: framebuffer.pitch(),
-            bpp: framebuffer.bpp(),
+            width: framebuffer.info().width,
+            height: framebuffer.info().height,
+            pitch: framebuffer.info().stride,
+            bpp: framebuffer.info().bytes_per_pixel as u8,
             buffer: unsafe {
                 slice::from_raw_parts_mut(
-                    framebuffer.address() as *mut u8,
-                    (framebuffer.pitch() * framebuffer.height()) as usize,
+                    framebuffer.buffer_mut().as_mut_ptr(),
+                    framebuffer.buffer_mut().len(),
                 )
             },
         };
@@ -586,10 +586,12 @@ impl Graphics {
 /// Global graphics instance
 pub static GRAPHICS: Mutex<Option<Graphics>> = Mutex::new(None);
 
-/// Initialize graphics with framebuffer
-pub fn init(framebuffer: &'static FramebufferTag) {
-    let graphics = Graphics::new(framebuffer);
-    *GRAPHICS.lock() = Some(graphics);
+/// Initialize graphics with the framebuffer provided by the bootloader
+pub fn init(boot_info: &'static BootInfo) {
+    if let Some(fb) = boot_info.framebuffer.as_mut() {
+        let graphics = Graphics::new(fb);
+        *GRAPHICS.lock() = Some(graphics);
+    }
 }
 
 /// Draw a pixel

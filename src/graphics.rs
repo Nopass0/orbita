@@ -1,11 +1,12 @@
+use bootloader::framebuffer::{Framebuffer as BootFramebuffer, PixelFormat as BootPixelFormat};
 use bootloader::BootInfo;
 use core::fmt::Write;
 use font8x8::{UnicodeFonts, BASIC_FONTS};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
-// Stub types for now - will need to fix these based on actual bootloader API
-type FrameBuffer = ();
+// Actual framebuffer type provided by the bootloader
+type FrameBuffer = BootFramebuffer;
 #[derive(Debug, Clone, Copy)]
 enum PixelFormat {
     RGB,
@@ -27,20 +28,23 @@ struct FrameBufferInfo {
 }
 
 impl Framebuffer {
-    pub fn new(_framebuffer: &'static mut FrameBuffer) -> Self {
-        // Stub implementation - needs to be fixed with actual bootloader API
+    pub fn new(framebuffer: &'static mut FrameBuffer) -> Self {
+        let fb_info = framebuffer.info();
         let info = FrameBufferInfo {
-            width: 800,
-            height: 600,
-            stride: 800,
-            bytes_per_pixel: 4,
-            pixel_format: PixelFormat::RGB,
+            width: fb_info.width as usize,
+            height: fb_info.height as usize,
+            stride: fb_info.stride,
+            bytes_per_pixel: fb_info.bytes_per_pixel,
+            pixel_format: match fb_info.pixel_format {
+                BootPixelFormat::Rgb => PixelFormat::RGB,
+                BootPixelFormat::Bgr => PixelFormat::BGR,
+                _ => PixelFormat::RGB,
+            },
         };
 
-        Self {
-            buffer: unsafe { core::slice::from_raw_parts_mut(0 as *mut u8, 0) },
-            info,
-        }
+        let buffer = framebuffer.buffer_mut();
+
+        Self { buffer, info }
     }
 
     pub fn draw_pixel(&mut self, x: usize, y: usize, color: Color) {
@@ -126,10 +130,11 @@ lazy_static! {
     pub static ref FRAMEBUFFER: Mutex<Option<Framebuffer>> = Mutex::new(None);
 }
 
-pub fn init(_boot_info: &'static BootInfo) {
-    // Stub implementation - needs to be fixed with actual bootloader API
-    // For now, we just create an empty framebuffer
-    // This will not work at runtime but will allow compilation
+pub fn init(boot_info: &'static BootInfo) {
+    if let Some(fb) = boot_info.framebuffer.as_mut() {
+        let framebuffer = Framebuffer::new(fb);
+        *FRAMEBUFFER.lock() = Some(framebuffer);
+    }
 }
 
 pub struct GraphicsWriter {
