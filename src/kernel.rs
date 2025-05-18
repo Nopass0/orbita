@@ -6,7 +6,8 @@ pub fn start() {
     serial_println!("Orbita OS Starting...");
 
     // Очистка экрана
-    if let Some(ref mut fb) = *FRAMEBUFFER.lock() {
+    let mut fb_lock = FRAMEBUFFER.lock();
+    if let Some(ref mut fb) = fb_lock.as_mut() {
         fb.clear(BLACK);
 
         // Рисуем заголовок

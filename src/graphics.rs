@@ -148,7 +148,8 @@ impl GraphicsWriter {
     }
 
     pub fn write_string(&mut self, s: &str) {
-        if let Some(ref mut fb) = *FRAMEBUFFER.lock() {
+        let mut fb_lock = FRAMEBUFFER.lock();
+        if let Some(ref mut fb) = fb_lock.as_mut() {
             for c in s.chars() {
                 if c == '\n' {
                     self.x = 10;

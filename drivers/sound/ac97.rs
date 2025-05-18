@@ -1,5 +1,7 @@
 #![no_std]
 
+extern crate alloc;
+
 //! AC97 Sound Driver for Orbita OS
 //! 
 //! Implements basic AC97 audio codec support
