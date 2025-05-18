@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  orbita-dev:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: orbita-dev:latest
+    container_name: orbita-dev
+    volumes:
+      - ..:/orbita
+    working_dir: /orbita
+    command: /bin/bash
+    stdin_open: true
+    tty: true
+    networks:
+      - orbita-network
+
+networks:
+  orbita-network:
+    driver: bridge
