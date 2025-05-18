@@ -1,18 +1,15 @@
-use x86_64::{
-    structures::paging::{Page, PageTable, PhysFrame, Mapper, Size4KiB, FrameAllocator},
-    VirtAddr,
-    PhysAddr,
-};
 use bootloader::bootinfo::{MemoryMap, MemoryRegionType};
+use x86_64::{
+    structures::paging::{FrameAllocator, Mapper, Page, PageTable, PhysFrame, Size4KiB},
+    PhysAddr, VirtAddr,
+};
 
 pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
     let level_4_table = active_level_4_table(physical_memory_offset);
     OffsetPageTable::new(level_4_table, physical_memory_offset)
 }
 
-unsafe fn active_level_4_table(physical_memory_offset: VirtAddr)
-    -> &'static mut PageTable
-{
+unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut PageTable {
     use x86_64::registers::control::Cr3;
 
     let (level_4_table_frame, _) = Cr3::read();
@@ -39,10 +36,8 @@ impl BootInfoFrameAllocator {
 
     fn usable_frames(&self) -> impl Iterator<Item = PhysFrame> {
         let regions = self.memory_map.iter();
-        let usable_regions = regions
-            .filter(|r| r.region_type == MemoryRegionType::Usable);
-        let addr_ranges = usable_regions
-            .map(|r| r.range.start_addr()..r.range.end_addr());
+        let usable_regions = regions.filter(|r| r.region_type == MemoryRegionType::Usable);
+        let addr_ranges = usable_regions.map(|r| r.range.start_addr()..r.range.end_addr());
         let frame_addresses = addr_ranges.flat_map(|r| r.step_by(4096));
         frame_addresses.map(|addr| PhysFrame::containing_address(PhysAddr::new(addr)))
     }
@@ -68,8 +63,6 @@ pub fn create_example_mapping(
     let frame = PhysFrame::containing_address(PhysAddr::new(0xb8000));
     let flags = Flags::PRESENT | Flags::WRITABLE;
 
-    let map_to_result = unsafe {
-        mapper.map_to(page, frame, flags, frame_allocator)
-    };
+    let map_to_result = unsafe { mapper.map_to(page, frame, flags, frame_allocator) };
     map_to_result.expect("map_to failed").flush();
 }

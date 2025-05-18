@@ -36,6 +36,9 @@ tinybmp = { version = "0.5", default-features = false }
 
 [build-dependencies]
 bootloader = "0.9"
+bootloader-locator = "0.0.4"
+
+[dev-dependencies]
 
 [package.metadata.bootloader]
 minimum-stack-size = 100000
