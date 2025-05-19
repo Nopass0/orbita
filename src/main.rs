@@ -20,6 +20,7 @@ mod kernel;
 mod memory;
 mod serial;
 mod vga_buffer;
+mod drivers;
 
 entry_point!(kernel_main);
 
