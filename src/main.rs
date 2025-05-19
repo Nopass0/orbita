@@ -23,6 +23,7 @@ mod memory;
 mod window_manager;
 mod serial;
 mod vga_buffer;
+mod drivers;
 
 entry_point!(kernel_main);
 

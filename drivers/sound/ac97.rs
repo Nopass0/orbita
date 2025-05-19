@@ -16,8 +16,13 @@ const AC97_EXTENDED_ID: u16 = 0x28;
 const AC97_EXTENDED_STATUS: u16 = 0x2A;
 const AC97_PCM_FRONT_DAC_RATE: u16 = 0x2C;
 
-const NAM_BASE: u16 = 0x0;  // Native Audio Mixer
+const NAM_BASE: u16 = 0x0; // Native Audio Mixer
 const NABM_BASE: u16 = 0x10; // Native Audio Bus Master
+
+// Bus master registers
+const BD_BAR: u16 = 0x00; // Buffer Descriptor List Base Address
+const BD_LAST_VALID: u16 = 0x05; // Last Valid Index
+const BD_CONTROL: u16 = 0x1B; // Control Register
 
 /// AC97 Buffer Descriptor
 #[repr(C, packed)]
@@ -124,28 +129,56 @@ impl AC97Driver {
         Ok(())
     }
 
-    /// Play PCM audio data
+    /// Prepare DMA buffer and start playback
     pub fn play_audio(&mut self, data: &[u8]) -> Result<(), SoundError> {
         if !self.initialized {
             return Err(SoundError::NotInitialized);
         }
 
-        // Setup buffer descriptors
-        // This is simplified - real implementation would use DMA
-        
-        // Start playback
+        self.setup_dma(data)?;
+
         unsafe {
-            let mut control_port = Port::<u8>::new(self.nabm_base + 0x1B);
-            control_port.write(0x01); // Start playback
+            let mut ctrl = Port::<u8>::new(self.nabm_base + BD_CONTROL);
+            ctrl.write(0x01); // Run
         }
-        
+
+        Ok(())
+    }
+
+    /// Setup DMA descriptors for the provided buffer
+    fn setup_dma(&mut self, data: &[u8]) -> Result<(), SoundError> {
+        if data.is_empty() {
+            return Err(SoundError::BufferOverflow);
+        }
+
+        self.buffer_descriptors.clear();
+        for chunk in data.chunks(4096) {
+            let desc = BufferDescriptor {
+                addr: chunk.as_ptr() as u32,
+                samples: (chunk.len() / 2) as u16,
+                flags: 0x8000,
+            };
+            self.buffer_descriptors.push(desc);
+        }
+
+        if self.buffer_descriptors.is_empty() {
+            return Err(SoundError::BufferOverflow);
+        }
+
+        unsafe {
+            let mut bdbar = Port::<u32>::new(self.nabm_base + BD_BAR);
+            bdbar.write(self.buffer_descriptors.as_ptr() as u32);
+            let mut lvi = Port::<u8>::new(self.nabm_base + BD_LAST_VALID);
+            lvi.write((self.buffer_descriptors.len() - 1) as u8);
+        }
+
         Ok(())
     }
 
     /// Stop audio playback
     pub fn stop(&mut self) -> Result<(), SoundError> {
         unsafe {
-            let mut control_port = Port::<u8>::new(self.nabm_base + 0x1B);
+            let mut control_port = Port::<u8>::new(self.nabm_base + BD_CONTROL);
             control_port.write(0x00); // Stop playback
         }
         Ok(())

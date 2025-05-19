@@ -27,6 +27,10 @@ pub fn start() {
     }
 
     serial_println!("Graphics initialized");
+
+    // Detect audio devices via PCI
+    let audio = crate::drivers::pci::find_audio_devices();
+    serial_println!("Found {} audio device(s)", audio.len());
     serial_println!("System ready");
 
     // Основной цикл ядра
