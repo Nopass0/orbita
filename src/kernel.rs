@@ -1,20 +1,29 @@
 use crate::graphics::{Color, GraphicsWriter, BLACK, FRAMEBUFFER, WHITE};
+use crate::mouse::MouseCursor;
+use crate::window_manager::{Window, WindowManager};
 use core::fmt::Write;
 use crate::serial_println;
 
 pub fn start() {
     serial_println!("Orbita OS Starting...");
 
+    // Initialize simple window manager and cursor
+    let mut wm = WindowManager::new();
+    wm.add_window(Window {
+        x: 50,
+        y: 50,
+        width: 300,
+        height: 200,
+        title: "Demo",
+    });
+    let cursor = MouseCursor::new();
+
     // Очистка экрана
     if let Some(ref mut fb) = *FRAMEBUFFER.lock() {
         fb.clear(BLACK);
-
-        // Рисуем заголовок
-        fb.draw_string("Orbita OS v0.1", 10, 10, WHITE);
-        fb.draw_string("==================", 10, 20, WHITE);
-
-        // Рисуем простой интерфейс
-        draw_ui(fb);
+        wm.draw();
+        cursor.draw();
+        fb.swap_buffers();
     }
 
     serial_println!("Graphics initialized");
@@ -27,57 +36,3 @@ pub fn start() {
     }
 }
 
-fn draw_ui(fb: &mut crate::graphics::Framebuffer) {
-    // Рисуем панель задач
-    fb.fill_rect(
-        0,
-        fb.info.height - 40,
-        fb.info.width,
-        40,
-        Color::new(64, 64, 64),
-    );
-    fb.draw_string("Orbita OS", 10, fb.info.height - 30, WHITE);
-
-    // Рисуем окно терминала
-    let terminal_x = 50;
-    let terminal_y = 50;
-    let terminal_width = 600;
-    let terminal_height = 400;
-
-    // Заголовок окна
-    fb.fill_rect(
-        terminal_x,
-        terminal_y,
-        terminal_width,
-        30,
-        Color::new(128, 128, 128),
-    );
-    fb.draw_string("Terminal", terminal_x + 10, terminal_y + 10, WHITE);
-
-    // Тело окна
-    fb.fill_rect(
-        terminal_x,
-        terminal_y + 30,
-        terminal_width,
-        terminal_height - 30,
-        BLACK,
-    );
-    fb.draw_string(
-        "> Welcome to Orbita OS",
-        terminal_x + 10,
-        terminal_y + 40,
-        Color::new(0, 255, 0),
-    );
-    fb.draw_string(
-        "> System initialized",
-        terminal_x + 10,
-        terminal_y + 55,
-        Color::new(0, 255, 0),
-    );
-    fb.draw_string(
-        "> _",
-        terminal_x + 10,
-        terminal_y + 70,
-        Color::new(0, 255, 0),
-    );
-}

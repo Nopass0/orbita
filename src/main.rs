@@ -15,9 +15,12 @@ use x86_64::VirtAddr;
 mod allocator;
 mod gdt;
 mod graphics;
+mod graphics_accel;
 mod interrupts;
 mod kernel;
+mod mouse;
 mod memory;
+mod window_manager;
 mod serial;
 mod vga_buffer;
 

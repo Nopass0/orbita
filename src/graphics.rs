@@ -1,6 +1,7 @@
 use bootloader::framebuffer::{Framebuffer as BootFramebuffer, PixelFormat as BootPixelFormat};
 use bootloader::BootInfo;
 use core::fmt::Write;
+use alloc::vec::Vec;
 use font8x8::{UnicodeFonts, BASIC_FONTS};
 use lazy_static::lazy_static;
 use spin::Mutex;
@@ -15,6 +16,7 @@ enum PixelFormat {
 
 pub struct Framebuffer {
     buffer: &'static mut [u8],
+    back_buffer: Vec<u8>,
     info: FrameBufferInfo,
 }
 
@@ -43,8 +45,18 @@ impl Framebuffer {
         };
 
         let buffer = framebuffer.buffer_mut();
+        let back_buffer = vec![0; buffer.len()];
 
-        Self { buffer, info }
+        Self {
+            buffer,
+            back_buffer,
+            info,
+        }
+    }
+
+    /// Copy the back buffer to the screen buffer
+    pub fn swap_buffers(&mut self) {
+        self.buffer.copy_from_slice(&self.back_buffer);
     }
 
     pub fn draw_pixel(&mut self, x: usize, y: usize, color: Color) {
@@ -56,16 +68,15 @@ impl Framebuffer {
 
             match self.info.pixel_format {
                 PixelFormat::RGB => {
-                    self.buffer[byte_offset] = r;
-                    self.buffer[byte_offset + 1] = g;
-                    self.buffer[byte_offset + 2] = b;
+                    self.back_buffer[byte_offset] = r;
+                    self.back_buffer[byte_offset + 1] = g;
+                    self.back_buffer[byte_offset + 2] = b;
                 }
                 PixelFormat::BGR => {
-                    self.buffer[byte_offset] = b;
-                    self.buffer[byte_offset + 1] = g;
-                    self.buffer[byte_offset + 2] = r;
+                    self.back_buffer[byte_offset] = b;
+                    self.back_buffer[byte_offset + 1] = g;
+                    self.back_buffer[byte_offset + 2] = r;
                 }
-                _ => {}
             }
         }
     }
