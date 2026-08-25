@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  host-tests:
+    name: Host tests (workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Run host tests
+        run: cargo test --workspace --exclude orbita-kernel
+
+  kernel-build:
+    name: Kernel (x86_64-unknown-uefi)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-unknown-uefi
+      - name: Build kernel (release, warnings denied)
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo build --release -p orbita-kernel --target x86_64-unknown-uefi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orbita-kernel-efi
+          path: target/x86_64-unknown-uefi/release/orbita-kernel.efi
+
+  apps-build:
+    name: Applications (x86_64-unknown-none + delivery image)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-unknown-none
+      - name: Check SDK against the application target
+        run: cargo check -p orbita-sdk --target x86_64-unknown-none
+      - name: Pack all applications (ELF → ORBEXEC → FAT image)
+        run: cargo run --release -p orbita-build -- pack-all
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orbita-pkg-image
+          path: target/orbita-pkg.img
+
+  docs:
+    name: rust-doc (no warnings)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Build docs, warnings denied
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --workspace --exclude orbita-kernel
+
+  qemu-smoke:
+    name: QEMU boot smoke (native apps)
+    runs-on: ubuntu-latest
+    needs: [kernel-build, apps-build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: orbita-kernel-efi
+          path: kernel
+      - uses: actions/download-artifact@v4
+        with:
+          name: orbita-pkg-image
+          path: .
+      - name: Install QEMU + OVMF
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 ovmf
+      - name: Assemble ESP + disk
+        run: |
+          mkdir -p target/orbita-esp/EFI/BOOT
+          cp kernel/orbita-kernel.efi target/orbita-esp/EFI/BOOT/BOOTX64.EFI
+          printf 'fs0:\\EFI\\BOOT\\BOOTX64.EFI\n' > target/orbita-esp/startup.nsh
+          truncate -s 16M target/orbita-disk.img
+          mkdir -p target/qemu-firmware
+          cp /usr/share/OVMF/OVMF_CODE.fd target/qemu-firmware/edk2-x86_64-code.fd 2>/dev/null || \
+            sudo cp /usr/share/ovmf/OVMF.fd target/qemu-firmware/edk2-x86_64-code.fd
+          cp target/qemu-firmware/edk2-x86_64-code.fd target/qemu-firmware/edk2-vars.fd
+      - name: Boot and capture serial
+        run: |
+          timeout 60 qemu-system-x86_64 -machine q35 -m 512M -smp 4 \
+            -drive file=target/orbita-disk.img,format=raw,if=none,id=orbitadisk \
+            -device ich9-ahci,id=orbita_ahci \
+            -device ide-hd,drive=orbitadisk,bus=orbita_ahci.0 \
+            -drive format=raw,if=none,id=orbitapkg,file=target/orbita-pkg.img \
+            -device ide-hd,drive=orbitapkg,bus=orbita_ahci.1 \
+            -drive if=pflash,format=raw,readonly=on,file=target/qemu-firmware/edk2-x86_64-code.fd \
+            -drive if=pflash,format=raw,file=target/qemu-firmware/edk2-vars.fd \
+            -drive format=raw,file=fat:rw:target/orbita-esp \
+            -netdev user,id=orbitanet -device e1000,netdev=orbitanet \
+            -display none -serial file:smoke.log || true
+      - name: Verify boot markers
+        run: |
+          set -e
+          check() { grep -aq "$1" smoke.log && echo "OK  $1" || { echo "MISSING  $1"; exit 1; }; }
+          check "drivers registered=3 bound=3"
+          check "e1000 up"
+          check "esp fat mounted"
+          check "pkg delivery staged 2"
+          check "hello from a native rust app"
+          check "read back: written by native app hello"
+          check "== orbita sysinfo =="
+          check "autorun hello exit=0"
+          check "autorun sysinfo exit=0"
+          BOOTS=$(grep -ac "UEFI entry reached" smoke.log || true)
+          if [ "$BOOTS" -ne 1 ]; then echo "BOOT CYCLES: $BOOTS (expected 1)"; exit 1; fi
+          if grep -aq "panic" smoke.log; then echo "PANIC FOUND"; exit 1; fi
+          echo "SMOKE PASSED"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-log
+          path: smoke.log

@@ -13,7 +13,6 @@
 //!    captured stdout lines.
 
 use core::alloc::Layout;
-use core::ffi::c_void;
 use core::ptr;
 use core::sync::atomic::{AtomicI32, AtomicPtr, AtomicU64, Ordering};
 use core::time::Duration;
@@ -24,7 +23,7 @@ use spin::Mutex;
 
 use orbita_abi::{AbiStatus, AbiStr, OrbAbi, ABI_VERSION};
 use orbita_fs::MemoryVolume;
-use orbita_std::{format, println};
+use orbita_std::format;
 
 /// Disable the firmware's NX policy: UEFI maps loader-data pages (where
 /// native applications are loaded) as non-executable. After

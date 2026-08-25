@@ -966,11 +966,4 @@ fn on_keyboard_irq(_: u8) {
     KEYBOARD_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Serial-only diagnostic print used during boot-crash bisection.
-macro_rules! debug_println {
-    ($($arg:tt)*) => {
-        orbita_platform::log_line_fmt(format_args!($($arg)*))
-    };
-}
-#[allow(unused_imports)]
-pub(crate) use debug_println;
+

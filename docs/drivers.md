@@ -22,6 +22,25 @@ class/subclass, MMIO BAR-ы) или legacy (`ps2-keyboard`).
 
 ## Пайплайн привязки
 
+```mermaid
+flowchart TB
+    PCI[PciInventory::scan] --> PROBES[DeviceProbe: PCI + MMIO BARs]
+    LEGACY[Legacy-пробы: ps2-keyboard] --> PROBES
+    PROBES --> BIND{DriverManager::bind_all}
+    BIND -->|probe?| D1[ahci-storage]
+    BIND -->|probe?| D2[ps2-keyboard]
+    BIND -->|probe?| D3[e1000]
+    D1 --> A1{attach: ABAR, BM, порт 0/1}
+    D2 --> A2{attach: i8042 probe}
+    D3 --> A3{attach: BAR0 MMIO, кольца}
+    A1 -->|Ok| S[start → готово]
+    A2 -->|Ok| S
+    A3 -->|Ok| S
+    A1 -.->|Err| REP[BindReport: причина]
+    A3 -.->|Err| REP
+    S --> SVC[Сервисы ядра: downcast по имени<br/>take_disk / take_nic / dispatch_irq]
+```
+
 ```
 kernel_main:
   probes = pci_probes(&PciInventory) + legacy-пробы

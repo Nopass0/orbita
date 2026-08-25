@@ -620,3 +620,22 @@ J — когда драйверная база готова; K — горизо�
 - Тесты: ~75 host-тестов; QEMU smoke headless: boots=1, app exit=0.
 - Родмап переписан: сверхподробные Этапы A–K, таблица состояния,
   ограничения v1, порядок исполнения, этот changelog.
+
+
+## Граф зависимостей этапов
+
+```mermaid
+flowchart LR
+    A[A · paging/user-mode] --> B[B · SMP]
+    A --> D[D · TCP/сокеты]
+    A --> H[H · безопасность]
+    B --> C[C · virtio-gpu→Vulkan]
+    C --> F[F · HTML/CSS UI]
+    D --> I[I · пакеты из сети]
+    E[E · драйверы] --> C
+    E --> J[J · железо]
+    G[G · perf] -.-> B & C & D
+    K[K · тулчейн] -.-> I
+    F --> UX[UX уровня Windows]
+    C --> UX
+```

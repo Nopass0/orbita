@@ -3,6 +3,49 @@
 Как Rust-приложение собирается на хосте, доставляется в ОС и исполняется
 нативно.
 
+## Жизненный цикл приложения
+
+```mermaid
+sequenceDiagram
+    participant Dev as Разработчик (хост)
+    participant OB as orbita-build
+    participant Q as QEMU (диск pkg)
+    participant K as Ядро Orbita
+    participant App as Приложение (ring0 v1)
+
+    Dev->>OB: dm alias pkgbuild
+    OB->>OB: cargo x86_64-unknown-none (rust-lld, base 0x10000000)
+    OB->>OB: ELF → ORBEXEC (.orbpkg)
+    OB->>OB: FAT16-образ (fat_writer)
+    OB->>Q: target/orbita-pkg.img
+    Note over K: boot: ahci-storage порт 1 → FAT mount → /pkg staged
+    K->>K: pkg install hello (/apps) или autorun (auto=1)
+    K->>K: ELF-лоадер (PT_LOAD, bss-zero) + стек 256КБ
+    K->>App: orb_main(&ABI_TABLE) — Win64↔SysV мост
+    App->>K: ABI-вызовы (stdout/fs/mem/time/os/net)
+    App-->>K: report_exit(code)
+    K-->>Dev: [app]-строки в serial, exit=N, ОС продолжает работу
+```
+
+## Слой ABI
+
+```mermaid
+flowchart LR
+    subgraph App[Приложение · x86_64-unknown-none · SysV]
+        SDK[orbita-sdk<br/>entry! / println! / sys::*]
+        ALLOC[global_allocator]
+    end
+    subgraph Kernel[Ядро · x86_64-unknown-uefi · Win64]
+        T[ABI_TABLE · orbita-abi · sysv64]
+        IMPL[реализации: fs→MemoryVolume, mem→heap,<br/>stdout→терминал+serial, …]
+    end
+    SDK -- "косвенный вызов через таблицу" --> T
+    ALLOC --> T
+    T --> IMPL
+    note1["Граница будущей изоляции: приложение<br/>не линкуется с ядром"] -.-> T
+```
+
+
 ## Поток данных
 
 ```

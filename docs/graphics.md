@@ -63,3 +63,17 @@ orbita_video::register_backend(
 - virtio-gpu: 2D host blits (QEMU) — первый ускоренный бэкенд;
 - композитор per-window surfaces + vsync-презент;
 - GPU memory manager и загрузка пикселей без CPU-копий.
+
+## Выбор бэкенда (runtime)
+
+```mermaid
+stateDiagram-v2
+    [*] --> Boot: UEFI GOP framebuffer
+    Boot --> Registry: register_backend(name, factory)<br/>(по умолчанию: software-framebuffer)
+    Registry --> Selected: чтение /etc/orbita.conf<br/>gfx=<имя>
+    Selected --> Software: имя неизвестно → fallback
+    Selected --> Custom: имя найдено в реестре
+    Software --> Present: present_region(dirty)
+    Custom --> Present
+    Present --> [*]: каждый кадр, только изменённые строки
+```

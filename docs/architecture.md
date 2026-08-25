@@ -231,6 +231,39 @@ Recommended sequence:
 
 # Обновление архитектуры (2026-08)
 
+## Карта слоёв (текущая)
+
+```mermaid
+flowchart TD
+    subgraph Kernel[orbita-kernel]
+        MAIN[kernel_main + модули<br/>boot console config disk drivers seed ui input hosts abi]
+    end
+    subgraph AppsLayer[Приложения · apps/*]
+        SDKAPP[orbita-sdk приложения<br/>hello · sysinfo]
+    end
+    ABI[orbita-abi — C-ABI таблица sysv64]
+    DRV[orbita-drivers — Driver/DriverManager]
+    HW[orbita-hw — AHCI · e1000 · PCI · APIC · PS/2 · SMP · timer]
+    VID[orbita-video — PresentBackend+реестр · композитор]
+    DSK[orbita-desktop — сцены/dirty-rect]
+    NET[orbita-net — ARP/IPv4/ICMP/UDP/TCP · NetworkStack]
+    FS[orbita-fs — OrbitaFS · MemoryVolume · FAT r/w]
+    MM[orbita-mm — frames · heap · vm/RegionMap · paging(A,в работе)]
+    PROC[orbita-process — ORBEXEC · ProcessEngine]
+    SH[orbita-shell — парсер · pkg/run/ps/ping]
+    RT[runtime/async/scheduler/threading/sync]
+    CORE[core/platform/proto/std/arch-x86_64]
+    DM[dm + orbita-build — сборка/доставка]
+
+    MAIN --> DRV & VID & NET & FS & MM & PROC & SH & RT & CORE
+    DRV --> HW
+    SDKAPP --> ABI
+    ABI -.->|мост Win64↔SysV| MAIN
+    DSK --> VID
+    DM -.->|pkg-образ /pkg| FS
+```
+
+
 ## Драйверная платформа
 
 `orbita-drivers::driver` — контракт `Driver` (probe→attach→start→stop/irq)

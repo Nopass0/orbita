@@ -1,5 +1,6 @@
 #![no_std]
 
+pub mod paging;
 pub mod vm;
 
 use core::alloc::{GlobalAlloc, Layout};
