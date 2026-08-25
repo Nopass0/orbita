@@ -69,6 +69,27 @@ huge↔4K, identity+skip-existing). CI: host-tests снова зелёные.
 - переключение CR3 после ExitBootServices + smoke (критическая точка —
   задействовать QEMU-маркеры; откат по бэкап-ветке при triple fault).
 
+### 2026-08-25 — порция 3: KernelFrameMemory + dry-run identity-мап 🔄
+
+**Сделано:**
+- `orbita-kernel/src/paging_setup.rs`:
+  - `KernelFrameMemory` — `FrameMemory` поверх `BootstrapFrameAllocator`
+    (identity-доступ к фреймам таблиц, контракт задокументирован);
+  - `dry_run_identity_map` — строит PML4 + identity 0..usable-top (≤1GiB)
+    в 2 MiB huge-страницах, спот-проверка translate середины карты,
+    **БЕЗ переключения CR3**;
+  - `maybe_run_dry_run` — гейт по `/etc/orbita.conf`
+    `paging_dry_run=on` (включён в default-конфиг).
+- Интеграция в `kernel_main` после применения живого конфига.
+
+**Тесты:** QEMU smoke — `paging dry-run ok: pml4=0x8000 huge_pages=256
+span=512 MiB`; boots=1, hello/sysinfo exit=0, panic=0 (ничего не сломано).
+Host: workspace 84 passed / 0 failed.
+
+**Дальше (порция 4):** переключение CR3 на новый PML4 (identity на
+старте), затем kernel-half 0xFFFF8000… и per-process таблицы; smoke с
+маркером `paging: cr3 switched` и откатом при triple fault.
+
 ---
 
 *(шаблон порции: дата → Сделано/Тесты/Дальше; статусы: ⬜ planned,

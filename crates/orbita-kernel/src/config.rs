@@ -11,7 +11,7 @@ use crate::console::*;
 pub(crate) const ORBITA_CONF: &str = "/etc/orbita.conf";
 
 pub(crate) fn orbita_conf_default() -> &'static str {
-    "hostname=orbita\nmodules=full\nboot_splash=on\n"
+    "hostname=orbita\nmodules=full\nboot_splash=on\npaging_dry_run=on\n"
 }
 
 /// Parses "key=value" lines.
@@ -96,4 +96,13 @@ pub(crate) fn preferred_graphics_backend(text: &str) -> orbita_core::GraphicsBac
         }
     }
     orbita_core::GraphicsBackend::SoftwareFramebuffer
+}
+
+/// Whether `/etc/orbita.conf` enables the stage-A paging dry run
+/// (`paging_dry_run=on`): build an identity map in 2 MiB huge pages
+/// without switching CR3. On by default for fresh installs.
+pub(crate) fn wants_paging_dry_run(text: &str) -> bool {
+    parse_conf(text)
+        .iter()
+        .any(|(key, value)| key == "paging_dry_run" && (value == "on" || value == "1"))
 }

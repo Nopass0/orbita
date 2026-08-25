@@ -48,6 +48,7 @@ mod drivers;
 mod seed;
 mod ui;
 mod input;
+mod paging_setup;
 mod hosts;
 
 use boot::*;
@@ -564,6 +565,13 @@ fn kernel_main(boot_info: BootInfo) -> ! {
                 conf_text
             };
             apply_orbita_conf(&conf_text, &mut console, &mut shell_fs);
+            // Stage-A: prove the frame supply + mapper end-to-end (no CR3 switch).
+            paging_setup::maybe_run_dry_run(
+                &mut frame_allocator,
+                boot_info.memory_regions(),
+                &conf_text,
+                1 << 30, // dry-run covers low 1 GiB
+            );
             let kind = disk.inner.storage_kind().label();
             println!(
                 "Orbita OS: orbitafs medium={} capacity={} used={} ({}.{:02}%) boots={boots} files={} dirs={}",
