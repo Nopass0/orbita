@@ -1,0 +1,12 @@
+[package]
+name = "orbita-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+orbita-async = { path = "../orbita-async" }
+orbita-scheduler = { path = "../orbita-scheduler" }
+orbita-sync = { path = "../orbita-sync" }
+orbita-threading = { path = "../orbita-threading" }

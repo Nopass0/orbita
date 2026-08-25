@@ -1,0 +1,9 @@
+[package]
+name = "orbita-hw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+orbita-arch-x86_64 = { path = "../orbita-arch-x86_64" }

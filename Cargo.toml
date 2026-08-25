@@ -1,0 +1,46 @@
+[workspace]
+members = [
+    "crates/orbita-abi",
+    "crates/orbita-arch-x86_64",
+    "crates/orbita-build",
+    "crates/orbita-core",
+    "crates/orbita-desktop",
+    "crates/orbita-drivers",
+    "crates/orbita-async",
+    "crates/orbita-fs",
+    "crates/orbita-hw",
+    "crates/orbita-kernel",
+    "crates/orbita-mm",
+    "crates/orbita-net",
+    "crates/orbita-process",
+    "crates/orbita-sdk",
+    "crates/orbita-platform",
+    "crates/orbita-proto",
+    "crates/orbita-runtime",
+    "crates/orbita-scheduler",
+    "crates/orbita-std",
+    "crates/orbita-shell",
+    "crates/orbita-sync",
+    "crates/orbita-threading",
+    "crates/orbita-video",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Bogdan Galin"]
+
+[workspace.dependencies]
+spin = "0.9.8"
+uefi = "0.36.1"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+lto = "thin"
+panic = "abort"
+codegen-units = 1
+opt-level = 2

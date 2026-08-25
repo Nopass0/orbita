@@ -1,0 +1,57 @@
+use orbita_core::BuiltinApp;
+
+pub struct BootSplash<'a> {
+    pub framebuffer_width: usize,
+    pub framebuffer_height: usize,
+    pub usable_memory: &'a str,
+}
+
+pub struct DesktopConsoleSnapshot<'a> {
+    pub history: &'a str,
+    pub prompt: &'a str,
+    pub cursor_visible: bool,
+}
+
+pub struct DesktopScene<'a> {
+    pub framebuffer_width: usize,
+    pub framebuffer_height: usize,
+    pub gpu_identity: &'a str,
+    pub graphics_backend: &'a str,
+    pub graphics_api: &'a str,
+    pub present_mode: &'a str,
+    pub frames_in_flight: usize,
+    pub logical_cpus: u32,
+    pub volume_total: &'a str,
+    pub volume_free: &'a str,
+    pub status: &'a str,
+    pub files_cwd: &'a str,
+    pub files_listing: &'a str,
+    pub toolchains_text: &'a str,
+    pub network_text: &'a str,
+    pub services_text: &'a str,
+    pub runtime_services_text: &'a str,
+    pub events_text: &'a str,
+    pub files_selected_name: &'a str,
+    pub files_preview_text: &'a str,
+    pub settings_section: &'a str,
+    pub active_app: &'static BuiltinApp,
+    pub active_app_index: usize,
+    pub hovered_app_index: Option<usize>,
+    pub focused_surface: &'a str,
+    pub hovered_surface: &'a str,
+    pub chrome_panel: &'a str,
+    pub chrome_body_text: &'a str,
+    pub chrome_query: &'a str,
+    pub start_hovered: bool,
+    pub search_hovered: bool,
+    pub tray_hovered: bool,
+    pub start_active: bool,
+    pub search_active: bool,
+    pub tray_active: bool,
+    pub main_window_focused: bool,
+    pub system_window_focused: bool,
+    pub preview_window_focused: bool,
+    pub pointer_x: usize,
+    pub pointer_y: usize,
+    pub console: DesktopConsoleSnapshot<'a>,
+}

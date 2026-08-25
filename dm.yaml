@@ -1,0 +1,91 @@
+version: 1
+project_name: orbita-os
+
+# ---------------------------------------------------------------------------
+# Orbita OS — dev_manager (dm) configuration.
+#
+#   dm build              assemble the UEFI image (cargo parallelizes over all cores)
+#   dm start              boot in QEMU with hot reload (rebuild + reboot on change)
+#   dm alias run          rebuild + boot
+#
+# Notes on dm 1.0.0 execution model (verified on this host):
+#   * `services.*.run` is tokenized WITHOUT a shell and executed directly,
+#     so it must not depend on `sh` being on PATH (PowerShell has no sh!).
+#     Everything goes through `cmd /c` + a .cmd wrapper, which works from
+#     PowerShell, cmd, and Git Bash alike.
+#   * `build.stages.command` runs via the platform shell (cmd /C on
+#     Windows); the stage scripts are plain .cmd files for the same reason.
+# ---------------------------------------------------------------------------
+
+services:
+  # UEFI kernel in QEMU. Every watcher-triggered restart re-runs the
+  # wrapper, which rebuilds first — the machine always boots a fresh image.
+  qemu:
+    path: .
+    language: other
+    tags: [os, uefi, x86_64]
+    run: 'cmd /c scripts\qemu-run.cmd'
+    watch: true
+    restart_on_change: true
+    order: 20
+
+profiles:
+  os:
+    services: [qemu]
+  all:
+    services: [qemu]
+
+build:
+  output_dir: dist
+  clean: false
+  stages:
+    # 0 — build & pack native Rust applications (apps/) into .orbpkg
+    #     bundles; the esp stage ships them into the OS /pkg channel.
+    - name: "0. apps (x86_64-unknown-none, orbita-build)"
+      source: .
+      command: 'scripts\dm-build.cmd apps'
+      artifacts:
+        - "target/orbita-pkg/hello.orbpkg"
+        - "target/orbita-pkg/sysinfo.orbpkg"
+
+    # 1 — compile the no_std UEFI kernel (cargo uses every host core).
+    - name: "1. kernel (x86_64-unknown-uefi, release)"
+      source: .
+      command: "cargo build --release -p orbita-kernel --target x86_64-unknown-uefi"
+      artifacts:
+        - "target/x86_64-unknown-uefi/release/orbita-kernel.efi"
+
+    # 2 — assemble the FAT ESP image QEMU boots from and publish the EFI
+    #     binary into dist/ as the distributable artifact.
+    - name: "2. assemble ESP + publish EFI"
+      source: .
+      command: 'scripts\dm-build.cmd esp'
+      artifacts:
+        - "target/orbita-esp/EFI/BOOT/BOOTX64.EFI"
+        - "dist/orbita-x86_64-uefi.efi"
+
+    # 3 — stage the EDK2 firmware for the pflash drives. QEMU cannot share
+    #     the readonly code file while another instance holds it, so copy
+    #     both files on every build. Override the source directory with
+    #     ORBITA_QEMU_SHARE (default: a Windows QEMU install).
+    - name: "3. stage EDK2 firmware"
+      source: .
+      command: 'scripts\dm-build.cmd firmware'
+      artifacts:
+        - "target/qemu-firmware/edk2-x86_64-code.fd"
+        - "target/qemu-firmware/edk2-vars.fd"
+
+linter:
+  dr: false
+  kiss: false
+  unused_code: true
+  duplicates: true
+
+aliases:
+  run: "dm build && dm start --only=qemu"
+  os: "dm start --only=qemu"
+  doctor: "qemu-system-x86_64 --version && qemu-system-x86_64 -device help"
+  pkgbuild: "cargo run --release -p orbita-build -- pack-all && dm build"
+  appnew: "cargo run --release -p orbita-build -- new"
+  test: "cargo test --workspace --exclude orbita-kernel"
+  doc: "cargo doc --no-deps --workspace --exclude orbita-kernel"

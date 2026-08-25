@@ -1,0 +1,26 @@
+[package]
+name = "orbita-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+spin.workspace = true
+orbita-abi = { path = "../orbita-abi" }
+orbita-core = { path = "../orbita-core" }
+orbita-desktop = { path = "../orbita-desktop" }
+orbita-drivers = { path = "../orbita-drivers" }
+orbita-fs = { path = "../orbita-fs" }
+orbita-hw = { path = "../orbita-hw" }
+orbita-mm = { path = "../orbita-mm" }
+orbita-net = { path = "../orbita-net" }
+orbita-process = { path = "../orbita-process" }
+orbita-arch-x86_64 = { path = "../orbita-arch-x86_64" }
+orbita-platform = { path = "../orbita-platform" }
+orbita-proto = { path = "../orbita-proto" }
+orbita-runtime = { path = "../orbita-runtime" }
+orbita-shell = { path = "../orbita-shell" }
+orbita-std = { path = "../orbita-std" }
+orbita-video = { path = "../orbita-video" }
+uefi = { workspace = true, features = ["alloc"] }

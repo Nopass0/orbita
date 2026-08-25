@@ -1,0 +1,17 @@
+[package]
+name = "sysinfo"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+orbita-sdk = { path = "../../../crates/orbita-sdk" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+
+[package.metadata.orbita]
+auto = true

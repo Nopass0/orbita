@@ -1,0 +1,15 @@
+/target
+/dist
+*.log
+/target-*
+
+# generated artifacts
+backup-*.zip
+target/smoke.log
+target/qemu-int.log
+target/monitor.log
+target/orbita-pkg.img
+target/orbita-disk.img
+apps/*/target
+apps/**/target/
+.zcode/

@@ -1,0 +1,13 @@
+[package]
+name = "orbita-std"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+libm = "0.2.11"
+orbita-mm = { path = "../orbita-mm" }
+orbita-platform = { path = "../orbita-platform" }
+orbita-runtime = { path = "../orbita-runtime" }
+orbita-sync = { path = "../orbita-sync" }

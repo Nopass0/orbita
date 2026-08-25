@@ -1,0 +1,10 @@
+[package]
+name = "orbita-build"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Host-side Orbita application build & packaging tool"
+
+[dependencies]
+orbita-fs = { path = "../orbita-fs" }

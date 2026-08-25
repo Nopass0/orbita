@@ -1,0 +1,10 @@
+[package]
+name = "orbita-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Public Orbita OS API: the crate applications compile against"
+
+[dependencies]
+orbita-abi = { path = "../orbita-abi" }
