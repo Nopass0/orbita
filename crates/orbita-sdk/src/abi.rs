@@ -87,5 +87,11 @@ unsafe impl GlobalAlloc for AbiHeap {
 }
 
 /// The application heap, installed for every binary linking the SDK.
+///
+/// Test binaries keep the host `std` allocator: the harness allocates
+/// before `orb_main` could ever run, so routing it through the ABI table
+/// would abort the very first allocation (`table()` panics until
+/// [`install`]).
+#[cfg(not(test))]
 #[global_allocator]
 static HEAP: AbiHeap = AbiHeap;
