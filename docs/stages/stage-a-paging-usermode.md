@@ -41,6 +41,34 @@
 - kernel-half (0xFFFF8000_00000000+) для ядра, user — низ;
 - hugepages (2MiB) для кучи ядра.
 
+
+### 2026-08-25 — порция 2: hugepages 2 MiB + identity-маппер 🔄
+
+**Сделано:**
+- `orbita-mm/src/paging.rs`:
+  - константы `HUGE` (PS-бит), `ADDR_MASK`, `HUGE_ADDR_MASK`,
+    `PAGE_SIZE_2M`;
+  - `map_2mib(virt, phys, flags)` — huge-запись в PD (без аллокации PT),
+    проверка 2 MiB-выравнивания;
+  - `translate`/`unmap_page` понимают huge-записи (level PD);
+  - `map_identity_2mib(start, end, flags)` — идентичное отображение
+    региона огромными страницами, пропуск уже замапленного
+    (для инкрементальной пересборки firmware-карты).
+- CI-фиксы (тот же день): QEMU smoke — путь pkg-образа (`mv` в
+  target/), перебор вариантов OVMF (4M/обычный), guard пустого
+  smoke.log; ORBEXEC-тест стал самодостаточным (без артефакта сборки);
+  убран дубль `#[test]` в diskfs.
+
+**Тесты:** mm 15→19 (huge мап/транс/анмап, невыравнивание, конфликт
+huge↔4K, identity+skip-existing). CI: host-tests снова зелёные.
+
+**Дальше (порция 3):**
+- `KernelFrameMemory` — реализация `FrameMemory` поверх реального
+  `BootstrapFrameAllocator` ядра (физические фреймы таблиц);
+- построение полной identity-карты (0..RAM top + MMIO) в новом PML4;
+- переключение CR3 после ExitBootServices + smoke (критическая точка —
+  задействовать QEMU-маркеры; откат по бэкап-ветке при triple fault).
+
 ---
 
 *(шаблон порции: дата → Сделано/Тесты/Дальше; статусы: ⬜ planned,

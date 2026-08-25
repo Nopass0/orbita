@@ -20,8 +20,16 @@ pub const PRESENT: u64 = 1 << 0;
 pub const WRITABLE: u64 = 1 << 1;
 pub const USER: u64 = 1 << 2;
 pub const NO_EXEC: u64 = 1 << 63;
+/// PS bit: marks a 2 MiB huge page in a PD entry.
+pub const HUGE: u64 = 1 << 7;
 /// Everything except the address bits and reserved — mask for flags.
 pub const FLAGS_MASK: u64 = 0x000F_FFFF_0000_0FFF & !NO_EXEC | NO_EXEC;
+/// Address part of a regular (4 KiB) entry.
+pub const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+/// Address part of a 2 MiB huge entry (bits 13..20 are reserved).
+pub const HUGE_ADDR_MASK: u64 = 0x000F_FFFF_FFE0_0000;
+/// Size of one 2 MiB huge page.
+pub const PAGE_SIZE_2M: u64 = 0x20_0000;
 
 /// Canonical virtual address.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -115,13 +123,82 @@ impl PageTableMapper {
             if entry & PRESENT == 0 {
                 return None;
             }
-            let next = entry & !FLAGS_MASK;
+            if level == 2 && entry & HUGE != 0 {
+                // 2 MiB huge page: address is 2 MiB aligned.
+                return Some((Phys(entry & HUGE_ADDR_MASK), entry & FLAGS_MASK));
+            }
+            let next = entry & ADDR_MASK;
             if level == 3 {
                 return Some((Phys(next), entry & FLAGS_MASK));
             }
             frame = next;
         }
         None
+    }
+
+    /// Map a whole 2 MiB huge page: `virt`/`phys` must be 2 MiB aligned.
+    ///
+    /// The PD entry is created with `flags | PRESENT | HUGE`; no PT is
+    /// allocated for this region.
+    pub fn map_2mib(
+        &mut self,
+        mem: &mut dyn FrameMemory,
+        virt: Virt,
+        phys: Phys,
+        flags: u64,
+    ) -> Result<(), MapError> {
+        if virt.0 % PAGE_SIZE_2M != 0 || phys.0 % PAGE_SIZE_2M != 0 {
+            // Misalignment is a caller bug: reject instead of corrupting
+            // the table.
+            return Err(MapError::AlreadyMapped);
+        }
+        let mut frame = self.pml4_frame;
+        for level in 0..2 {
+            let existing = {
+                let table = mem.frame(frame).ok_or(MapError::FrameExhausted)?;
+                table[index_at(virt, level)]
+            };
+            let next = if existing & PRESENT == 0 {
+                let fresh = mem.alloc_frame().ok_or(MapError::FrameExhausted)?;
+                let table = mem.frame_mut(frame).ok_or(MapError::FrameExhausted)?;
+                table[index_at(virt, level)] = fresh | PRESENT | WRITABLE | USER;
+                fresh
+            } else {
+                existing & ADDR_MASK
+            };
+            frame = next;
+        }
+        let table = mem.frame_mut(frame).ok_or(MapError::FrameExhausted)?;
+        let slot = &mut table[index_at(virt, 2)];
+        if *slot & PRESENT != 0 {
+            return Err(MapError::AlreadyMapped);
+        }
+        *slot = phys.0 | flags | PRESENT | HUGE;
+        Ok(())
+    }
+
+    /// Identity-map `[start, end)` in 2 MiB huge pages (`end` exclusive).
+    ///
+    /// Returns the number of huge pages mapped; already-present entries
+    /// are skipped (useful when rebuilding the firmware map incrementally).
+    pub fn map_identity_2mib(
+        &mut self,
+        mem: &mut dyn FrameMemory,
+        start: u64,
+        end: u64,
+        flags: u64,
+    ) -> Result<usize, MapError> {
+        let mut mapped = 0usize;
+        let mut at = start;
+        while at < end {
+            match self.map_2mib(mem, Virt(at), Phys(at), flags) {
+                Ok(()) => mapped += 1,
+                Err(MapError::AlreadyMapped) => {}
+                Err(other) => return Err(other),
+            }
+            at += PAGE_SIZE_2M;
+        }
+        Ok(mapped)
     }
 
     /// Unmap `virt` (clears the leaf entry). Returns the old physical
@@ -134,14 +211,19 @@ impl PageTableMapper {
             if entry & PRESENT == 0 {
                 return Err(MapError::NotMapped);
             }
-            frame = entry & !FLAGS_MASK;
+            if level == 2 && entry & HUGE != 0 {
+                let phys = Phys(entry & HUGE_ADDR_MASK);
+                table[index_at(virt, 2)] = 0;
+                return Ok(phys);
+            }
+            frame = entry & ADDR_MASK;
         }
         let table = mem.frame_mut(frame).ok_or(MapError::NotMapped)?;
         let slot = &mut table[index_at(virt, 3)];
         if *slot & PRESENT == 0 {
             return Err(MapError::NotMapped);
         }
-        let phys = Phys(*slot & !FLAGS_MASK);
+        let phys = Phys(*slot & ADDR_MASK);
         *slot = 0;
         Ok(phys)
     }
@@ -262,6 +344,52 @@ mod tests {
         }
         let (phys, _) = mapper.translate(&ram, Virt(0x0040_0000 + 511 * 0x1000)).unwrap();
         assert_eq!(phys, Phys(511 * 0x1000 + 0x10_0000));
+    }
+
+    #[test]
+    fn huge_page_map_translate_unmap() {
+        let mut ram = RamFrames::new(64);
+        let mut mapper = PageTableMapper::new(ram.alloc_frame().unwrap());
+        mapper
+            .map_2mib(&mut ram, Virt(0x4000_0000), Phys(0x4000_0000), WRITABLE | NO_EXEC)
+            .expect("map 2MiB");
+        // Any offset inside the huge page translates to its base.
+        let (phys, flags) = mapper.translate(&ram, Virt(0x4000_1234)).expect("translate");
+        assert_eq!(phys, Phys(0x4000_0000));
+        assert_ne!(flags & NO_EXEC, 0);
+        let removed = mapper.unmap_page(&mut ram, Virt(0x4001_2345)).expect("unmap huge");
+        assert_eq!(removed, Phys(0x4000_0000));
+        assert!(mapper.translate(&ram, Virt(0x4000_0000)).is_none());
+    }
+
+    #[test]
+    fn huge_page_misalignment_rejected() {
+        let mut ram = RamFrames::new(64);
+        let mut mapper = PageTableMapper::new(ram.alloc_frame().unwrap());
+        assert!(mapper.map_2mib(&mut ram, Virt(0x1000), Phys(0x0), 0).is_err());
+        assert!(mapper.map_2mib(&mut ram, Virt(0x0), Phys(0x1000), 0).is_err());
+    }
+
+    #[test]
+    fn huge_and_4k_conflict_detected() {
+        let mut ram = RamFrames::new(64);
+        let mut mapper = PageTableMapper::new(ram.alloc_frame().unwrap());
+        mapper.map_2mib(&mut ram, Virt(0x4000_0000), Phys(0x4000_0000), 0).unwrap();
+        // A 4K map inside the huge region hits the present PD entry path.
+        assert!(mapper.map_page(&mut ram, Virt(0x4000_1000), Phys(0x9000), 0).is_err());
+    }
+
+    #[test]
+    fn identity_region_maps_and_skips_existing() {
+        let mut ram = RamFrames::new(4096);
+        let mut mapper = PageTableMapper::new(ram.alloc_frame().unwrap());
+        let mapped = mapper.map_identity_2mib(&mut ram, 0, 16 * PAGE_SIZE_2M, WRITABLE).unwrap();
+        assert_eq!(mapped, 16);
+        // Re-running skips present entries instead of failing.
+        let again = mapper.map_identity_2mib(&mut ram, 0, 16 * PAGE_SIZE_2M, WRITABLE).unwrap();
+        assert_eq!(again, 0);
+        let (phys, _) = mapper.translate(&ram, Virt(5 * PAGE_SIZE_2M + 0x777)).unwrap();
+        assert_eq!(phys, Phys(5 * PAGE_SIZE_2M));
     }
 
     #[test]
