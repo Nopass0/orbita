@@ -746,7 +746,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn root_listing_excludes_itself_and_dirs_not_readable() {
         let mut disk = RamDisk::new(128);
         OrbitaDiskFs::format(&mut disk, 128).expect("format");
@@ -766,6 +765,7 @@ mod tests {
         assert!(!fs.is_dir("/bin/tool"));
     }
 
+    #[test]
     fn mount_unformatted_fails() {
         let mut disk = RamDisk::new(1024);
         assert_eq!(OrbitaDiskFs::mount(&mut disk).err(), Some(MountError::NotFormatted));

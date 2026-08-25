@@ -82,19 +82,32 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 ovmf
-      - name: Assemble ESP + disk
+      - name: Assemble ESP + disk + firmware
         run: |
-          mkdir -p target/orbita-esp/EFI/BOOT
+          set -e
+          mkdir -p target/orbita-esp/EFI/BOOT target/qemu-firmware
           cp kernel/orbita-kernel.efi target/orbita-esp/EFI/BOOT/BOOTX64.EFI
           printf 'fs0:\\EFI\\BOOT\\BOOTX64.EFI\n' > target/orbita-esp/startup.nsh
           truncate -s 16M target/orbita-disk.img
-          mkdir -p target/qemu-firmware
-          cp /usr/share/OVMF/OVMF_CODE.fd target/qemu-firmware/edk2-x86_64-code.fd 2>/dev/null || \
-            sudo cp /usr/share/ovmf/OVMF.fd target/qemu-firmware/edk2-x86_64-code.fd
-          cp target/qemu-firmware/edk2-x86_64-code.fd target/qemu-firmware/edk2-vars.fd
+          # The pkg delivery image downloads into the repo root — move it to
+          # the path the QEMU command expects.
+          mv -v orbita-pkg.img target/orbita-pkg.img
+          # Ubuntu names differ between releases — probe all known variants.
+          OVMF_CODE=""
+          for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/ovmf/OVMF.fd; do
+            [ -f "$f" ] && OVMF_CODE="$f" && break
+          done
+          OVMF_VARS=""
+          for f in /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd /usr/share/ovmf/OVMF_VARS.fd; do
+            [ -f "$f" ] && OVMF_VARS="$f" && break
+          done
+          [ -n "$OVMF_CODE" ] || { echo "OVMF code firmware not found"; ls -R /usr/share/OVMF /usr/share/ovmf || true; exit 1; }
+          cp "$OVMF_CODE" target/qemu-firmware/edk2-x86_64-code.fd
+          if [ -n "$OVMF_VARS" ]; then cp "$OVMF_VARS" target/qemu-firmware/edk2-vars.fd; else cp "$OVMF_CODE" target/qemu-firmware/edk2-vars.fd; fi
+          ls -la target/qemu-firmware target/*.img
       - name: Boot and capture serial
         run: |
-          timeout 60 qemu-system-x86_64 -machine q35 -m 512M -smp 4 \
+          timeout 90 qemu-system-x86_64 -machine q35 -m 512M -smp 4 \
             -drive file=target/orbita-disk.img,format=raw,if=none,id=orbitadisk \
             -device ich9-ahci,id=orbita_ahci \
             -device ide-hd,drive=orbitadisk,bus=orbita_ahci.0 \
@@ -105,6 +118,8 @@ jobs:
             -drive format=raw,file=fat:rw:target/orbita-esp \
             -netdev user,id=orbitanet -device e1000,netdev=orbitanet \
             -display none -serial file:smoke.log || true
+          # QEMU must have produced a serial log — otherwise the boot never ran.
+          [ -s smoke.log ] || { echo "smoke.log missing/empty — QEMU failed to boot"; cat smoke.log 2>/dev/null || true; exit 1; }
       - name: Verify boot markers
         run: |
           set -e
