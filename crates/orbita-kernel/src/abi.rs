@@ -334,8 +334,12 @@ pub(crate) fn exec_native(
     if ring3 {
         if !crate::paging_setup::app_region_is_user() {
             ABI_FS.store(ptr::null_mut(), Ordering::Relaxed);
-            return Err(String::from("run: ring3 exec needs USER-mapped app region"));
+            return Err(String::from("run: ring3 exec needs the user address space"));
         }
+        // Per-process address space (stage A, roadmap A.2/A.3): run under
+        // the user CR3 — the app sees only its USER region; restore the
+        // kernel CR3 on exit/kill.
+        crate::paging_setup::enter_user_address_space();
         RING3_EXEC.store(true, Ordering::Relaxed);
         // SAFETY: the ELF was loaded into the USER-mapped region; the
         // stack top stays inside it; the EXIT syscall (or a user-mode CPU
@@ -344,6 +348,7 @@ pub(crate) fn exec_native(
             orbita_arch_x86_64::syscall::enter_ring3(entry, USER_STACK_TOP)
         };
         RING3_EXEC.store(false, Ordering::Relaxed);
+        crate::paging_setup::restore_kernel_address_space();
         if code == orbita_arch_x86_64::syscall::FAULT_KILL_SENTINEL {
             // User-mode fault killed the process: conventional
             // "killed by signal 11" exit code, the kernel continues.

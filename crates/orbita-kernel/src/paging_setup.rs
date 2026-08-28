@@ -11,7 +11,8 @@
 //! user-half, per-process tables) follows in portion 4.
 
 use orbita_mm::paging::{
-    FrameMemory, PageTableMapper, Phys, Virt, ENTRIES, PAGE_SIZE_2M, USER, WRITABLE,
+    FrameMemory, PageTableMapper, Phys, Virt, ADDR_MASK, ENTRIES, PAGE_SIZE_2M, PRESENT, USER,
+    WRITABLE,
 };
 use orbita_mm::{BootstrapFrameAllocator, MemoryRegion, MemoryRegionKind};
 
@@ -305,36 +306,109 @@ const RING3_FAULT_STUB: [u8; 16] = [
     0xF4, 0xF4, 0xF4, 0xF4, 0xF4, 0xF4, 0xF4, 0xF4, // hlt (unreachable)
 ];
 
-/// Set once the app region carries USER pages (ring-3 exec requirement).
-static APP_REGION_USER: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Per-process address space for ring-3 execution (stage A, roadmap
+/// A.2/A.3): a user PML4 that shares every kernel table (all supervisor
+/// leaves — visible but untouchable from ring 3) and splices in a private
+/// chain for the app load region carrying USER pages:
+///
+/// ```text
+/// user PML4[0]      -> user PDPT  (rest of PML4 copied from kernel)
+/// user PDPT[0]      -> user PD    (rest copied from kernel's first PDPT)
+/// user PD[0x80]     -> user PT    (rest copied from kernel's first PD)
+/// user PT[0..256]   -> 4 KiB USER pages over the 1 MiB app region
+/// ```
+///
+/// Ring 3 therefore sees exactly one accessible window — the app region —
+/// while the kernel keeps full identity access on its own CR3. Building a
+/// second user PML4 with a different region is the fork/exec path.
+static USER_PML4: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static KERNEL_PML4: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Whether the app load region is USER-mapped (kernel tables only).
+/// App load region geometry (matches the loader reservation).
+const APP_BASE: u64 = crate::abi::APP_LOAD_BASE; // 0x1000_0000, 1 MiB
+const APP_REGION_PAGES: usize = 256; // 256 * 4 KiB
+/// PD index of the app region inside the first 1 GiB (0x1000_0000 / 2 MiB).
+const APP_PD_INDEX: usize = 0x80;
+
+/// Whether the per-process user address space is built (ring-3 exec gate).
 pub(crate) fn app_region_is_user() -> bool {
-    APP_REGION_USER.load(core::sync::atomic::Ordering::Relaxed)
+    USER_PML4.load(core::sync::atomic::Ordering::Relaxed) != 0
 }
 
-/// Replace the 2 MiB huge page over the app region with 4 KiB USER
-/// pages, so ring 3 can execute there. Live edit of the active tables.
-fn map_app_region_user(allocator: &mut BootstrapFrameAllocator<'_>) -> bool {
-    const BASE: u64 = crate::abi::APP_LOAD_BASE; // 0x1000_0000, 1 MiB reserved
-    const REGION_PAGES: u64 = 256; // 256 * 4 KiB = the reserved app area
+/// Builds the user address space by cloning the kernel chain and
+/// splicing the USER pages for the app region. Must run on kernel CR3
+/// after [`maybe_switch_cr3`]. Returns the user PML4 frame.
+pub(crate) fn build_user_address_space(
+    allocator: &mut BootstrapFrameAllocator<'_>,
+) -> Option<u64> {
+    let kernel_pml4 = orbita_arch_x86_64::cpu::read_cr3();
     let mut memory = KernelFrameMemory::new(allocator);
-    // The mapper edits the LIVE tables (CR3 == our PML4 since the switch).
-    let mut mapper = PageTableMapper::new(orbita_arch_x86_64::cpu::read_cr3());
-    if mapper.unmap_page(&mut memory, Virt(BASE)).is_err() {
-        return false;
-    }
-    for page in 0..REGION_PAGES {
-        let at = BASE + page * orbita_mm::PAGE_SIZE as u64;
-        if mapper
-            .map_page(&mut memory, Virt(at), Phys(at), WRITABLE | USER)
-            .is_err()
-        {
-            return false;
+
+    // Frames of the kernel chain we clone into.
+    let k_pdpt_frame = memory.frame(kernel_pml4)?[0] & ADDR_MASK;
+    let k_pd_frame = memory.frame(k_pdpt_frame)?[0] & ADDR_MASK;
+
+    // Four fresh zeroed frames for the user chain.
+    let user_pml4 = memory.alloc_frame()?;
+    let user_pdpt = memory.alloc_frame()?;
+    let user_pd = memory.alloc_frame()?;
+    let user_pt = memory.alloc_frame()?;
+
+    // SAFETY: every frame below is identity-mapped kernel memory; the
+    // freshly allocated ones are zeroed by the allocator contract.
+    unsafe {
+        let clone = |dst: u64, src: u64| {
+            core::ptr::copy_nonoverlapping(
+                src as *const [u64; ENTRIES],
+                dst as *mut [u64; ENTRIES],
+                1,
+            );
+        };
+        // PML4: clone everything except the low-half entry.
+        clone(user_pml4, kernel_pml4);
+        (*(user_pml4 as *mut [u64; ENTRIES]))[0] = user_pdpt | PRESENT | WRITABLE | USER;
+        // PDPT: clone the first 512 GiB except the first 1 GiB.
+        clone(user_pdpt, k_pdpt_frame);
+        (*(user_pdpt as *mut [u64; ENTRIES]))[0] = user_pd | PRESENT | WRITABLE | USER;
+        // PD: clone the first 1 GiB except the app region's 2 MiB.
+        clone(user_pd, k_pd_frame);
+        (*(user_pd as *mut [u64; ENTRIES]))[APP_PD_INDEX] =
+            user_pt | PRESENT | WRITABLE | USER;
+        // PT: 256 USER pages covering the reserved app region.
+        let pt = &mut *(user_pt as *mut [u64; ENTRIES]);
+        for page in 0..APP_REGION_PAGES {
+            pt[page] = (APP_BASE + page as u64 * orbita_mm::PAGE_SIZE as u64)
+                | PRESENT
+                | WRITABLE
+                | USER;
         }
     }
-    APP_REGION_USER.store(true, core::sync::atomic::Ordering::Relaxed);
+
+    KERNEL_PML4.store(kernel_pml4, core::sync::atomic::Ordering::Relaxed);
+    USER_PML4.store(user_pml4, core::sync::atomic::Ordering::Relaxed);
+    Some(user_pml4)
+}
+
+/// Switches CR3 to the user address space (before entering ring 3).
+/// Returns `false` when it was never built.
+pub(crate) fn enter_user_address_space() -> bool {
+    let user = USER_PML4.load(core::sync::atomic::Ordering::Relaxed);
+    if user == 0 {
+        return false;
+    }
+    // SAFETY: the user map is a clone of the kernel map — every running
+    // kernel address stays translated.
+    unsafe { switch_cr3(user) };
     true
+}
+
+/// Switches CR3 back to the kernel address space (after ring 3 exits).
+pub(crate) fn restore_kernel_address_space() {
+    let kernel = KERNEL_PML4.load(core::sync::atomic::Ordering::Relaxed);
+    if kernel != 0 {
+        // SAFETY: the original kernel tables.
+        unsafe { switch_cr3(kernel) };
+    }
 }
 
 /// Run the ring-3 roundtrip when `ring3_test=on` and the kernel owns CR3.
@@ -352,26 +426,31 @@ pub(crate) fn maybe_ring3_selftest(
     }
     const BASE: u64 = crate::abi::APP_LOAD_BASE; // 0x1000_0000, 1 MiB reserved
     const REGION_PAGES: u64 = 256; // 256 * 4 KiB = the reserved app area
+    let _ = REGION_PAGES;
 
-    if !map_app_region_user(allocator) {
-        orbita_platform::log_line("ring3: self-test aborted (USER remap failed)");
-        return;
-    }
+    let user_pml4 = match build_user_address_space(allocator) {
+        Some(frame) => frame,
+        None => {
+            orbita_platform::log_line("ring3: self-test aborted (user address space build failed)");
+            return;
+        }
+    };
     orbita_platform::log_line_fmt(format_args!(
-        "ring3: app region USER-mapped ({} pages at 0x{BASE:x})",
-        REGION_PAGES
+        "ring3: user address space ready (pml4=0x{user_pml4:x}, {APP_REGION_PAGES} USER pages at 0x{APP_BASE:x})"
     ));
 
     // SAFETY: the region is reserved loader memory, identity-mapped and
-    // now USER-accessible; the OS owns every byte of it.
+    // USER-mapped in the per-process tables; the OS owns every byte.
     unsafe {
         core::ptr::copy_nonoverlapping(RING3_STUB.as_ptr(), BASE as *mut u8, RING3_STUB.len());
         let user_rsp = BASE + REGION_PAGES * orbita_mm::PAGE_SIZE as u64 - 0x100;
         orbita_platform::log_line("ring3: stub+stack ready, installing gate");
         orbita_arch_x86_64::syscall::install_syscall_gate();
-        orbita_platform::log_line("ring3: gate installed, entering ring 3");
+        orbita_platform::log_line("ring3: gate installed, entering ring 3 (user CR3)");
+        enter_user_address_space();
         let ok = orbita_arch_x86_64::syscall::ring3_roundtrip(BASE, user_rsp);
-        orbita_platform::log_line("ring3: back in kernel after roundtrip");
+        restore_kernel_address_space();
+        orbita_platform::log_line("ring3: back in kernel after roundtrip (kernel CR3)");
         // The syscall gate runs with IF cleared (FMASK); restore the
         // kernel's pre-test interrupt state before continuing the boot.
         orbita_arch_x86_64::cpu::enable_interrupts();
@@ -389,23 +468,24 @@ pub(crate) fn maybe_ring3_selftest(
             BASE as *mut u8,
             RING3_FAULT_STUB.len(),
         );
-        let killed =
-            orbita_arch_x86_64::syscall::enter_ring3(BASE, user_rsp);
+        enter_user_address_space();
+        let killed = orbita_arch_x86_64::syscall::enter_ring3(BASE, user_rsp);
+        restore_kernel_address_space();
         // Raw-serial print (no fmt machinery / SERIAL mutex): the state
         // right after a fault-kill unwind is delicate — the plain-serial
         // path is the one the fault handler itself proves reliable.
         {
             use core::fmt::Write as _;
             let mut serial = orbita_arch_x86_64::serial::SerialPort::com1();
-            serial.write_str("ring3: fault-kill ok=");
-            serial.write_str(if killed
+            let _ = serial.write_str("ring3: fault-kill ok=");
+            let _ = serial.write_str(if killed
                 == orbita_arch_x86_64::syscall::FAULT_KILL_SENTINEL
             {
                 "true"
             } else {
                 "false"
             });
-            serial.write_str(" (kernel alive)");
+            let _ = serial.write_str(" (kernel alive)");
             serial.write_byte(b'\r');
             serial.write_byte(b'\n');
         }

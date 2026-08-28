@@ -135,6 +135,7 @@ jobs:
           check "autorun sysinfo exit=0"
           check "paging: cr3 switched"
           check "gdt installed"
+          check "ring3: user address space ready"
           check "ring3: roundtrip ok=true"
           check "autorun3 hello exit=0 ring3"
           check "autorun3 sysinfo exit=0 ring3"

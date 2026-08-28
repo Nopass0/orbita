@@ -291,6 +291,38 @@ fault-стабе был ошибкой (убитый процесс не рап�
 **Дальше (порция 9):** per-process PML4 + kernel-half 0xFFFF8000…,
 fork/exec (A.8), per-CPU GS + swapgs (A.9); diagnosis fmt-after-kill.
 
+### 2026-08-29 — порция 9: per-process адресное пространство (user CR3) ✅
+
+**Сделано:**
+- `paging_setup.rs`:
+  - `build_user_address_space` — user-PML4 клонирует kernel-цепочку
+    (PML4/PDPT/PD, кроме пути к app-региону) и вживляет приватную
+    USER-цепочку: PD[0x80] → PT со 256 USER-страницами app-региона.
+    Ring 3 видит ровно одно окно — свой регион; ядро/heap/MMIO —
+    supervisor (читать/писать нельзя);
+  - `enter_user_address_space` / `restore_kernel_address_space` —
+    CR3-переключатели вокруг ring3-исполнения (обе карты identity
+    мапят ядро — переключение безопасно на лету);
+  - USER-ремап app-региона УБРАН из kernel-таблиц (`map_app_region_user`
+    удалён) — ring3 существует только под user CR3.
+- `abi.rs::exec_native(ring3)`: CR3 → user перед `enter_ring3`, обратно
+  на kernel после выхода/kill.
+- Self-test: roundtrip и fault-проба под user CR3, маркер
+  `ring3: user address space ready (pml4=…)`; CI-маркер добавлен.
+
+**Тесты (3 бута):** `user address space ready` + `fault-kill ok=true` +
+ring3 hello/sysinfo exit=0 ×3, boots=1, единственный FAULT — намеренная
+проба; host 89/0; build 0 warnings.
+
+**Архитектурное значение:** каркас fork/exec готов — второй user-PML4 с
+другим регионом = отдельное адресное пространство процесса; kernel-half
+(0xFFFF8000…) встанет сюда же копированием hi-entries (сейчас весь
+kernel — identity low-half, что задокументировано как v1-ограничение).
+
+**Дальше (порция 10):** fork/exec с отдельными регионами (v2 isolation),
+hi-half kernel (A.2 завершение), per-CPU GS + swapgs (A.9),
+диагноз fmt-after-kill.
+
 ---
 
 *(шаблон порции: дата → Сделано/Тесты/Дальше; статусы: ⬜ planned,
