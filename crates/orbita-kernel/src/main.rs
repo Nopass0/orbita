@@ -307,11 +307,12 @@ fn kernel_main(boot_info: BootInfo) -> ! {
         local_apic.physical_base
     );
     println!(
-        "Orbita OS: idt installed vectors={} timer_vector={} keyboard_vector={} spurious_vector={}",
+        "Orbita OS: idt installed vectors={} timer_vector={} keyboard_vector={} spurious_vector={} fault_handlers={:?}",
         idt.vectors_installed,
         idt.timer_vector,
         idt.keyboard_vector,
-        idt.spurious_vector
+        idt.spurious_vector,
+        idt.fault_vectors
     );
     println!(
         "Orbita OS: ioapic base=0x{:x} redirs={} keyboard_irq_line={} keyboard_vector={} masked={}",
@@ -571,6 +572,15 @@ fn kernel_main(boot_info: BootInfo) -> ! {
                 boot_info.memory_regions(),
                 &conf_text,
                 1 << 30, // dry-run covers low 1 GiB
+            );
+            // Stage-A portion 4: switch CR3 to the kernel identity map.
+            let fb = framebuffer.info;
+            paging_setup::maybe_switch_cr3(
+                &mut frame_allocator,
+                boot_info.memory_regions(),
+                Some((fb.base as u64, fb.size_bytes as u64)),
+                &[(local_apic.physical_base, 0x1000), (0xFEC0_0000, 0x1000)],
+                &conf_text,
             );
             let kind = disk.inner.storage_kind().label();
             println!(

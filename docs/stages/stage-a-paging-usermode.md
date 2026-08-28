@@ -1,7 +1,8 @@
 # Этап A — Пейджинг и user-mode (ring 3) 🔄
 
 **Даты:** начат 2026-08-25
-**Статус:** в работе (первая порция: страничные таблицы — см. лог).
+**Статус:** в работе (порции 1–5: таблицы, hugepages, dry-run, CR3-переключение
+стабильно; дальше — kernel-half и ring 3).
 **Цель этапа:** реальные page tables, изоляция приложений, syscalls.
 
 ## Цель из roadmap (кратко)
@@ -86,9 +87,75 @@ huge↔4K, identity+skip-existing). CI: host-tests снова зелёные.
 span=512 MiB`; boots=1, hello/sysinfo exit=0, panic=0 (ничего не сломано).
 Host: workspace 84 passed / 0 failed.
 
-**Дальше (порция 4):** переключение CR3 на новый PML4 (identity на
-старте), затем kernel-half 0xFFFF8000… и per-process таблицы; smoke с
-маркером `paging: cr3 switched` и откатом при triple fault.
+### 2026-08-25 — порция 4: переключение CR3 (реализовано, ВЫКЛ по умолчанию) 🔄
+
+**Сделано:**
+- `paging_setup.rs`:
+  - `build_full_address_space` — identity-мап ВСЕХ дескрипторов boot map
+    (RAM/reserved/ACPI/MMIO, округление границ до 2 MiB) + явные extra
+    (GOP-фреймбуфер, LAPIC, IOAPIC);
+  - `switch_cr3` (naked-asm `mov cr3`), `maybe_switch_cr3` с гейтом
+    `paging_cr3=on|off` в orbita.conf.
+
+**QEMU факты:** переключение выполняется (`paging: cr3 switched to
+0xb000`), ОС продолжает часть бута — но крашится дальше. Причина:
+покрытие MMIO неполное/некорректное (нужно пройти полный firmware map
+с правками атрибутов и точными границами). **Вывод: код готов,
+выключен по умолчанию** (`paging_cr3=off`) — ОС работает на таблицах
+прошивки, пока порция 5 не закроет карту.
+
+**Тесты:** boots=1, автораны ок (switch off). Со switch — краш после
+`config from disk` (см. выше), ничего не маскируем.
+
+**Дальше (порция 5):** полная карта атрибутов дескрипторов
+(RX/RW/NOEXEC по типам), ACPI/HPET/PCI-ECAM добавки, последовательная
+включаемость + QEMU-перебор, затем user-half и ring 3.
+
+### 2026-08-28 — порция 5: CR3-переключение стабильно (вкл. по умолчанию) ✅
+
+**Диагноз краша порции 4 (два бага):**
+1. **Грязные фреймы таблиц.** `BootstrapFrameAllocator::allocate_frame`
+   не обнуляет фреймы, а контракт `FrameMemory::alloc_frame` требует
+   zeroed. Прохождение PML4→PDPT→PD по мусорным «present»-записям
+   писало листья в случайные физические фреймы. Симптомы: на warm-boot
+   dry-run рапортовал `huge_pages=0` (таблицы прошлого бута!), MMIO-запись
+   в устройство уходила в RAM (AHCI-таймауты `is=0 ci=0 tfd=0`).
+2. **Дыры между дескрипторами карты.** Фирменный memory-map не описывает
+   весь 32-битный PCI-hole (ECAM/BAR'ы AHCI+e1000 живут в промежутках) —
+   первое обращение драйвера после switch = #PF → (без обработчика)
+   triple fault → молчаливый ребут.
+
+**Сделано:**
+- `orbita-arch-x86_64/src/lib.rs` (cpu):
+  - asm-стабы `double_fault/general_protection/page_fault` (Win64: rcx/rdx,
+    shadow 32) + `FaultFrame` (err/rip/cs/rflags/rsp/ss);
+  - `orbita_x86_64_on_cpu_fault` — печать в serial (#PF добавляет CR2),
+    затем halt: fault теперь виден в логе, а не маскируется ресетом;
+  - читалки `read_cr2/read_cr3/read_cr4` (диагностика пейджинга).
+- `orbita-hw/src/irq.rs`: векторы 8/13/14 в IDT → стабы диагностики;
+  `IdtInstallReport.fault_vectors`.
+- `orbita-kernel/src/paging_setup.rs`:
+  - `KernelFrameMemory::alloc_frame` обнуляет фрейм (контракт соблюдён);
+  - `build_full_address_space`: **0..4 GiB целиком** (2048 huge pages —
+    все MMIO-дыры закрыты по построению) + дескрипторы >4 GiB (high RAM,
+    64-бит MMIO-окна, округление наружу до 2 MiB) + явные extra
+    (GOP fb, LAPIC, IOAPIC); skip-existing для пересечений;
+    отчёт `AddressSpaceReport` (pml4/huge/span) в serial.
+- `config.rs`: `paging_cr3=on` — валидировано, включено по умолчанию.
+- CI: маркер `paging: cr3 switched` в обязательные smoke-проверки.
+
+**Тесты (QEMU, q35/512M/smp4/OVMF, свежий + warm диск):**
+- cold boot: `cr3 switched to 0xb000 huge_pages=8192 span=16384 MiB`,
+  boots=1, все 13 smoke-маркеров, panic=0, fault=0, AHCI-таймаутов=0;
+  запись `/bin/orbita-shell.orbexec` на диск (ранее крашившая) проходит;
+- warm boot (boots=2): dry-run снова `huge_pages=256` (обнуление
+  работает), switch без fault — фреймы прошлого бута перезаписаны чисто.
+- Host: workspace 84 passed / 0 failed; kernel build 0 warnings;
+  rust-doc (`-D warnings`) чист.
+
+**Дальше (порция 6):** ядро → hi-half (0xFFFF8000…): kernel-half
+копируется в каждый новый PML4, identity-low остаётся на переход;
+затем GDT/TSS (IST1-3, user-сегменты) и syscall-шлюз (roadmap A.4/A.5).
 
 ---
 

@@ -22,6 +22,12 @@ pub const IRQ_BASE_VECTOR: u8 = 32;
 pub const TIMER_VECTOR: u8 = IRQ_BASE_VECTOR;
 pub const KEYBOARD_VECTOR: u8 = IRQ_BASE_VECTOR + 1;
 pub const SPURIOUS_VECTOR: u8 = 0xFF;
+/// Double fault (#DF) — error-code CPU exception.
+pub const DOUBLE_FAULT_VECTOR: u8 = 8;
+/// General protection fault (#GP) — error-code CPU exception.
+pub const GENERAL_PROTECTION_VECTOR: u8 = 13;
+/// Page fault (#PF) — error-code CPU exception; faulting address in CR2.
+pub const PAGE_FAULT_VECTOR: u8 = 14;
 
 type IrqHandler = fn(u8);
 
@@ -31,6 +37,8 @@ pub struct IdtInstallReport {
     pub timer_vector: u8,
     pub keyboard_vector: u8,
     pub spurious_vector: u8,
+    /// CPU-fault vectors with diagnostic handlers (#DF/#GP/#PF).
+    pub fault_vectors: &'static [u8],
 }
 
 #[derive(Copy, Clone)]
@@ -76,6 +84,11 @@ pub fn install_bootstrap_idt() -> IdtInstallReport {
     let irq_stub = cpu::irq_stub_addr();
     let timer_stub = cpu::timer_irq_stub_addr();
     let spurious_stub = cpu::spurious_irq_stub_addr();
+    let fault_vectors: &[u8] = &[
+        DOUBLE_FAULT_VECTOR,
+        GENERAL_PROTECTION_VECTOR,
+        PAGE_FAULT_VECTOR,
+    ];
 
     unsafe {
         let idt_ptr = core::ptr::addr_of_mut!(IDT) as *mut IdtEntry;
@@ -86,6 +99,12 @@ pub fn install_bootstrap_idt() -> IdtInstallReport {
         (*idt_ptr.add(TIMER_VECTOR as usize)).set_handler(timer_stub);
         (*idt_ptr.add(KEYBOARD_VECTOR as usize)).set_handler(irq_stub);
         (*idt_ptr.add(SPURIOUS_VECTOR as usize)).set_handler(spurious_stub);
+        // CPU exceptions print diagnostics (rip/CR2/error) instead of
+        // iretq-looping into a silent triple fault.
+        (*idt_ptr.add(DOUBLE_FAULT_VECTOR as usize)).set_handler(cpu::double_fault_stub_addr());
+        (*idt_ptr.add(GENERAL_PROTECTION_VECTOR as usize))
+            .set_handler(cpu::general_protection_stub_addr());
+        (*idt_ptr.add(PAGE_FAULT_VECTOR as usize)).set_handler(cpu::page_fault_stub_addr());
 
         let pointer = DescriptorTablePointer {
             limit: (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16,
@@ -99,6 +118,7 @@ pub fn install_bootstrap_idt() -> IdtInstallReport {
         timer_vector: TIMER_VECTOR,
         keyboard_vector: KEYBOARD_VECTOR,
         spurious_vector: SPURIOUS_VECTOR,
+        fault_vectors,
     }
 }
 

@@ -100,7 +100,7 @@ mount.rs` — свои inode/extents/bitmap/superblock, host-тесты).
 | Подсистема | Сейчас | Цель | Статус |
 |---|---|---|---|
 | Загрузка | UEFI→kernel, OrbitaFS, orbita.conf | То же + реальное UEFI-ПК, EDID | готово (QEMU) |
-| Память | heap + RegionMap-реестр, identity | PML4-пейджинг, user/kernel split, CoW, hugepages | частично (нет пейджинга) |
+| Память | **свои page tables в CR3** (0..4GiB + >4GiB identity, 2MiB huge, включено по умолчанию), #PF/#GP/#DF-обработчики с диагностикой; Protection в RegionMap всё ещё декоративен | user/kernel split, CoW, аппаратный Protection | частично (пейджинг ядра есть) |
 | Процессы | ORBEXEC ring0, pid/fds, ELF-лоадер | ring3, изоляция, fork/exec, panic-safe | частично |
 | Планировщик/CPU | round_robin (`scheduler/round_robin.rs`), 1 CPU фактический | per-CPU runqueues, preempt, tickless, IPI | частично |
 | Драйверы | Driver-платформа + AHCI/PS2/e1000 | NVMe, xHCI, HDA, virtio, pkg-драйверы | частично |
@@ -123,10 +123,14 @@ mount.rs` — свои inode/extents/bitmap/superblock, host-тесты).
    16→64-бит) вызывается лишь при `smp=1` в /etc/orbita.conf, и на
    OVMF/QEMU AP не выходят из park — исполняется только BSP.
 3. **Паника приложения вешает ядро**: panic-handler SDK печатает и
-   spin-ится; перехвата #GP/#PF с убийством процесса нет.
+   spin-ится; перехвата паник нет. #GP/#PF/#DF обрабатываются (печать
+   rip/CR2/err + halt вместо triple fault — этап A, порция 5), но
+   убийство процесса по fault ещё не реализовано (нужно ring 3).
 4. **TCP без state machine** — только parse/build сегментов, коннектов нет.
-5. **Нет пейджинга** — Protection в RegionMap декларативен, не
-   аппаратный.
+5. **Пейджинг — только identity-карта ядра** (этап A, порции 1–5):
+   CR3 переключается на собственные таблицы (0..4GiB + дескрипторы выше),
+   но user/kernel split, аппаратный Protection (RW/RO/RX) и CoW —
+   впереди (порции 6+).
 6. **Нет USB, аудио, GPU-ускорения**; Wi-Fi/BT — только модели.
 7. **UI без GPU** — весь рендер CPU в software framebuffer.
 8. Shell-процесс собирается как ORBEXEC «по правилам ОС», но исполняется
@@ -591,6 +595,13 @@ J — когда драйверная база готова; K — горизо�
 ---
 
 ## Changelog 2026-08
+
+- Этап A, порции 1–5: модуль пейджинга `orbita-mm/paging.rs` (4KiB +
+  2MiB huge, translate/unmap, 12 host-тестов), `KernelFrameMemory`
+  (zeroed-фреймы), полная identity-карта (0..4GiB + дескрипторы >4GiB),
+  **CR3-переключение стабильно и включено по умолчанию** (cold+warm
+  QEMU smoke), обработчики #PF/#GP/#DF с печатью rip/CR2/err в serial
+  вместо silent triple fault; CI-маркер `paging: cr3 switched`.
 
 - Модульное ядро: 23 крейта; main.rs разрезан на
   boot/console/config/disk/drivers/seed/ui/input/hosts/abi.

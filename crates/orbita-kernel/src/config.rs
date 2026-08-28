@@ -11,7 +11,7 @@ use crate::console::*;
 pub(crate) const ORBITA_CONF: &str = "/etc/orbita.conf";
 
 pub(crate) fn orbita_conf_default() -> &'static str {
-    "hostname=orbita\nmodules=full\nboot_splash=on\npaging_dry_run=on\n"
+    "hostname=orbita\nmodules=full\nboot_splash=on\npaging_dry_run=on\npaging_cr3=on\n"
 }
 
 /// Parses "key=value" lines.
@@ -105,4 +105,14 @@ pub(crate) fn wants_paging_dry_run(text: &str) -> bool {
     parse_conf(text)
         .iter()
         .any(|(key, value)| key == "paging_dry_run" && (value == "on" || value == "1"))
+}
+
+/// Whether `/etc/orbita.conf` enables switching CR3 to the kernel-built
+/// identity map (`paging_cr3=on`). On by default since stage-A portion 5:
+/// the map covers the whole low 4 GiB plus every descriptor above it, and
+/// QEMU smoke (cold + warm boot) passes on kernel tables.
+pub(crate) fn wants_paging_cr3(text: &str) -> bool {
+    parse_conf(text)
+        .iter()
+        .any(|(key, value)| key == "paging_cr3" && (value == "on" || value == "1"))
 }
