@@ -499,4 +499,32 @@ mod tests {
         // The loop cannot make progress: the limit must stop it, not hang.
         assert!(text.contains("iteration limit") || !text.contains("tick"));
     }
+
+    #[test]
+    fn arithmetic_counter_loop() {
+        // The classic counter loop — impossible before $(( )).
+        let (_, text, _) = fixture(
+            "i=0\nwhile test $i -lt 3\ndo\n  echo tick:$i\n  i=$((i+1))\ndone\necho final:$i\n",
+        );
+        assert!(text.contains("tick:0"));
+        assert!(text.contains("tick:1"));
+        assert!(text.contains("tick:2"));
+        assert!(text.contains("final:3"));
+        assert!(!text.contains("tick:3"));
+    }
+
+    #[test]
+    fn command_substitution_splices_output() {
+        let (_, text, _) = fixture(
+            "name=$(echo orbita)\necho hello-$name\necho host:$(uname)\n",
+        );
+        assert!(text.contains("hello-orbita"), "GOT: {text}");
+        assert!(text.contains("host:orbita-test"));
+    }
+
+    #[test]
+    fn arithmetic_with_variables_and_precedence() {
+        let (_, text, _) = fixture("a=6\nb=7\necho $((a*b)) $(( (a+b)/2 )) $((a < b))\n");
+        assert!(text.contains("42 6 1"));
+    }
 }

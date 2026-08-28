@@ -209,6 +209,20 @@ impl ShellRuntime {
         host: &mut dyn ShellHost,
         script: &ShellScript,
     ) {
+        self.execute_substituted(env, fs, output, host, script, 0);
+    }
+
+    /// Depth-carrying executor: pipelines inside `$( … )` substitutions
+    /// run through here so nested substitutions stay bounded.
+    pub(crate) fn execute_substituted<O: ShellOutput>(
+        &self,
+        env: &mut ShellEnvironment,
+        fs: &mut MemoryVolume,
+        output: &mut O,
+        host: &mut dyn ShellHost,
+        script: &ShellScript,
+        depth: u32,
+    ) {
         for pipeline in &script.pipelines {
             // `&&` / `||` statement chaining (scripting language).
             match pipeline.connector {
@@ -220,7 +234,7 @@ impl ShellRuntime {
             let last_index = pipeline.commands.len().saturating_sub(1);
             for (index, command) in pipeline.commands.iter().enumerate() {
                 let final_stage = index == last_index;
-                let result = self.execute_command(env, fs, host, command, &stdin);
+                let result = self.execute_command_at_depth(env, fs, host, command, &stdin, depth);
                 env.last_status = result.status;
 
                 if let Err(message) = apply_redirections(env, fs, command, &result.stdout) {
@@ -243,17 +257,21 @@ impl ShellRuntime {
         }
     }
 
-    fn execute_command(
+    /// Depth-tracked command executor: `$( )` substitutions recurse
+    /// through here (top level enters with depth 0).
+    fn execute_command_at_depth(
         &self,
         env: &mut ShellEnvironment,
         fs: &mut MemoryVolume,
         host: &mut dyn ShellHost,
         command: &SimpleCommand,
         pipeline_input: &str,
+        depth: u32,
     ) -> CommandResult {
         let mut scoped = env.vars.clone();
         for assignment in &command.assignments {
-            let value = expand_argument(env, &assignment.value);
+            let value =
+                expand_arg_with_substitution(self, env, fs, host, &assignment.value, &scoped, depth);
             scoped.insert(assignment.name.clone(), value.clone());
             if command.name.is_none() {
                 env.vars.insert(assignment.name.clone(), value);
@@ -270,11 +288,10 @@ impl ShellRuntime {
             return CommandResult::ok(String::new(), Some(String::from("ok")));
         };
 
-        let args: Vec<String> = command
-            .args
-            .iter()
-            .map(|arg| expand_argument_from(env, &scoped, arg))
-            .collect();
+        let mut args = Vec::new();
+        for arg in &command.args {
+            args.push(expand_arg_with_substitution(self, env, fs, host, arg, &scoped, depth));
+        }
 
         let result = match name.word.as_str() {
             "help" => help_text(),
@@ -1354,6 +1371,25 @@ fn expand_argument_from(
             continue;
         }
 
+        // Arithmetic expansion: $(( expr )) — nesting-aware scan.
+        if index + 2 < chars.len() && chars[index + 1] == '(' && chars[index + 2] == '(' {
+            if let Some(end) = find_arith_end(&chars, index + 3) {
+                let expr: String = chars[index + 3..end].iter().collect();
+                let vars = vars.clone();
+                let value = crate::arith::eval(&expr, |name| {
+                    resolve_var(env, &vars, name).trim().parse::<i64>().ok()
+                });
+                match value {
+                    Some(number) => out.push_str(&number.to_string()),
+                    // Division by zero / syntax error: keep the text as-is
+                    // so the failure is visible in the output.
+                    None => out.push_str(&chars[index..end + 3].iter().collect::<String>()),
+                }
+                index = end + 3;
+                continue;
+            }
+        }
+
         if index + 1 < chars.len() && chars[index + 1] == '{' {
             let mut end = index + 2;
             while end < chars.len() && chars[end] != '}' {
@@ -1391,6 +1427,114 @@ fn resolve_var(env: &ShellEnvironment, vars: &BTreeMap<String, String>, name: &s
         return env.last_status.to_string();
     }
     vars.get(name).cloned().unwrap_or_default()
+}
+
+/// Finds the `))` closing a `$((` opened before `start` (paren-nesting
+/// aware). Returns the index of the first `)` of the closing pair.
+fn find_arith_end(chars: &[char], start: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut index = start;
+    while index < chars.len() {
+        match chars[index] {
+            '(' => depth += 1,
+            ')' => {
+                if depth == 0 {
+                    // The first `)` of the closing `))`.
+                    return if index + 1 < chars.len() && chars[index + 1] == ')' {
+                        Some(index)
+                    } else {
+                        None
+                    };
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Command-substitution depth bound (`$( $( $( … ) ) )` chains).
+const MAX_SUBST_DEPTH: u32 = 4;
+
+/// Expands one argument: `$(cmd)` substitutions run the command and splice
+/// its (newline-trimmed) stdout, then `$VAR` / `$(( ))` expand as usual.
+fn expand_arg_with_substitution(
+    runtime: &ShellRuntime,
+    env: &mut ShellEnvironment,
+    fs: &mut MemoryVolume,
+    host: &mut dyn ShellHost,
+    arg: &CommandArg,
+    scoped: &BTreeMap<String, String>,
+    depth: u32,
+) -> String {
+    if !arg.expand || !arg.word.contains("$(") || arg.word.contains("$((") {
+        // No plain substitution; `$(( ))`-only words still need arithmetic.
+        return expand_argument_from(env, scoped, arg);
+    }
+    if depth >= MAX_SUBST_DEPTH {
+        return format!("substitution too deep: {}", arg.word);
+    }
+
+    let chars: Vec<char> = arg.word.chars().collect();
+    let mut out = String::new();
+    let mut index = 0usize;
+    while index < chars.len() {
+        if chars[index] != '$' {
+            out.push(chars[index]);
+            index += 1;
+            continue;
+        }
+        // Skip arithmetic: handled by expand_argument_from afterwards.
+        if index + 2 < chars.len() && chars[index + 1] == '(' && chars[index + 2] == '(' {
+            out.push('$');
+            index += 1;
+            continue;
+        }
+        if index + 1 >= chars.len() || chars[index + 1] != '(' {
+            out.push(chars[index]);
+            index += 1;
+            continue;
+        }
+        // Find the balanced `)` for this `$(`.
+        let Some(end) = (|| {
+            let mut depth_paren = 1i32;
+            let mut at = index + 2;
+            while at < chars.len() {
+                match chars[at] {
+                    '(' => depth_paren += 1,
+                    ')' => {
+                        depth_paren -= 1;
+                        if depth_paren == 0 {
+                            return Some(at);
+                        }
+                    }
+                    _ => {}
+                }
+                at += 1;
+            }
+            None
+        })() else {
+            out.push(chars[index]);
+            index += 1;
+            continue;
+        };
+        let inner: String = chars[index + 2..end].iter().collect();
+        let mut captured = CapturedOutput::default();
+        if let Ok(script) = runtime.parser.parse_script(&inner) {
+            runtime.execute_substituted(env, fs, &mut captured, host, &script, depth + 1);
+            let text = captured.text.trim_end_matches('\n');
+            // Multi-line output collapses to spaces (sh semantics).
+            out.push_str(&text.replace('\n', " "));
+        } else {
+            out.push_str(&inner);
+        }
+        index = end + 1;
+    }
+
+    // Remaining `$VAR` / `$(( ))` in the spliced text.
+    expand_argument_from(env, scoped, &CommandArg::new(out, arg.quoted, true))
 }
 
 fn resolve_path(cwd: &str, input: &str) -> String {

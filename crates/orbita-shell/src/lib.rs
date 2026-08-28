@@ -24,6 +24,7 @@ pub use command::{
     CommandArg, CommandLine, CommandName, CommandPipeline, CommandWord, ParsedCommand,
     RedirectKind, RedirectSpec, ShellAssignment, ShellCommandError, ShellScript, SimpleCommand,
 };
+pub mod arith;
 pub mod interp;
 pub use parser::{ParseError, ShellParser};
 pub use runtime::{NoopShellHost, ShellEnvironment, ShellHost, ShellOutput, ShellRuntime, ShellSystemInfo};

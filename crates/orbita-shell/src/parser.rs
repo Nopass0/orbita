@@ -200,6 +200,63 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
         }
 
         match ch {
+            '$' if matches!(chars.clone().next(), Some('(')) => {
+                // `$( … )` and `$(( … ))` stay ONE word (spaces, `<`, `>`
+                // inside belong to the expansion): consume through the
+                // balanced closing paren(s) into the current word.
+                current.push('$');
+                let _ = chars.next(); // '('
+                current.push('(');
+                if matches!(chars.peek(), Some('(')) {
+                    // Arithmetic: close on the matching `))`.
+                    let _ = chars.next();
+                    current.push('(');
+                    let mut depth = 0i32;
+                    let mut closed = false;
+                    while let Some(next) = chars.next() {
+                        match next {
+                            '(' => depth += 1,
+                            ')' => {
+                                if depth == 0 {
+                                    if matches!(chars.peek(), Some(')')) {
+                                        let _ = chars.next();
+                                        current.push_str("))");
+                                        closed = true;
+                                        break;
+                                    }
+                                    return Err(ParseError::UnterminatedQuote);
+                                }
+                                depth -= 1;
+                            }
+                            _ => {}
+                        }
+                        current.push(next);
+                    }
+                    if !closed {
+                        return Err(ParseError::UnterminatedQuote);
+                    }
+                } else {
+                    // Command substitution: close on the balanced `)`.
+                    let mut depth = 1i32;
+                    while let Some(next) = chars.next() {
+                        match next {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    current.push(')');
+                                    break;
+                                }
+                                current.push('(');
+                                continue;
+                            }
+                            _ => {}
+                        }
+                        current.push(next);
+                    }
+                }
+                expand = true;
+            }
             '\\' => escaped = true,
             '\'' => {
                 quote = QuoteState::Single;
