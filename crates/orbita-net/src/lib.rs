@@ -26,6 +26,7 @@ pub mod ipv4;
 pub mod nic;
 pub mod stack;
 pub mod tcp;
+pub mod tcp_state;
 pub mod udp;
 pub mod wifi;
 

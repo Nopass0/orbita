@@ -130,7 +130,9 @@ mount.rs` — свои inode/extents/bitmap/superblock, host-тесты).
    в ring3 ядро продолжает (порция 7); в ring0 (pre-switch автораны)
    всё ещё spin. #PF/#GP в ring3 сейчас = halt ядра с диагностикой;
    kill процесса по fault — порция 8 (roadmap A.7).
-4. **TCP без state machine** — только parse/build сегментов, коннектов нет.
+4. **TCP: state machine готова** (этап D, порция 1: `tcp_state.rs`,
+   11 состояний RFC 793, 21 host-тест), но интеграции в stack.rs ещё
+   нет — коннектов в живой ОС пока нет (сокет-слой, порция 2).
 5. **Пейджинг — только identity-карта ядра** (этап A, порции 1–5):
    CR3 переключается на собственные таблицы (0..4GiB + дескрипторы выше),
    но user/kernel split, аппаратный Protection (RW/RO/RX) и CoW —
@@ -684,3 +686,8 @@ flowchart LR
   (SegmentOutOfRange/EntryOutOfRange), негативный бут-тест с вредоносным
   ELF (CI-маркер); **hi-half алиас** 0..4GiB на 0xFFFF8000… в kernel-
   карте, наследуемый user-PML4 (проба каждый бут).
+- Этап D, порция 1: **TCP state machine** (`orbita-net/tcp_state.rs`) —
+  TcpState×11, TcpControlBlock, полный переходный матрикс (active/passive
+  open, simultaneous open/close, out-of-order re-ACK, half-close,
+  TIME_WAIT timeout, RST), close()/timeout()/data_sent API; 21 host-тест
+  «сегмент×состояние»; net 25→46, workspace 110/0.
