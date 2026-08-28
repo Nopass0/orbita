@@ -679,3 +679,8 @@ flowchart LR
   переключатели вокруг ring3-исполнения; USER-страницы убраны из
   kernel-таблиц — ring3 только под user CR3; каркас fork/exec готов.
   CI-маркер `ring3: user address space ready`.
+- Этап A, порция 10: **безопасность ELF-лоадера** — APP_IMAGE_LIMIT-
+  контракт (orbita-abi ↔ SDK), валидация entry/PT_LOAD по региону
+  (SegmentOutOfRange/EntryOutOfRange), негативный бут-тест с вредоносным
+  ELF (CI-маркер); **hi-half алиас** 0..4GiB на 0xFFFF8000… в kernel-
+  карте, наследуемый user-PML4 (проба каждый бут).

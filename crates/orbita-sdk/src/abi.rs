@@ -84,7 +84,7 @@ pub struct RegionHeap;
 
 impl RegionHeap {
     /// Bump region base (must stay clear of the linked app image).
-    const BASE: usize = 0x1008_0000;
+    const BASE: usize = orbita_abi::APP_IMAGE_LIMIT as usize;
     /// Bump region size (256 KiB).
     const SIZE: usize = 0x4_0000;
 }

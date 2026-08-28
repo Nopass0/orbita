@@ -238,6 +238,11 @@ pub(crate) enum LoadError {
     NotElf,
     UnsupportedElf,
     NoEntry,
+    /// Entry point outside the app load region.
+    EntryOutOfRange,
+    /// A PT_LOAD segment outside the app region / past the SDK heap base
+    /// (the loader must never write outside the reserved region).
+    SegmentOutOfRange,
 }
 
 fn u16_at(data: &[u8], offset: usize) -> u16 {
@@ -278,6 +283,13 @@ pub(crate) fn load_elf(image: &[u8]) -> Result<u64, LoadError> {
     if entry == 0 {
         return Err(LoadError::NoEntry);
     }
+    // Security (stage-A portion 10): every address the loader writes or
+    // jumps to must stay inside the reserved app region, below the SDK
+    // heap base — a crafted ORBEXEC must not reach kernel memory through
+    // the loader.
+    if entry < APP_LOAD_BASE || entry >= orbita_abi::APP_IMAGE_LIMIT {
+        return Err(LoadError::EntryOutOfRange);
+    }
 
     for index in 0..phnum {
         let ph = phoff + index * phentsize;
@@ -288,18 +300,32 @@ pub(crate) fn load_elf(image: &[u8]) -> Result<u64, LoadError> {
             continue;
         }
         let p_offset = u64_at(image, ph + 8) as usize;
-        let p_paddr = u64_at(image, ph + 24) as usize;
-        let p_filesz = u64_at(image, ph + 32) as usize;
-        let p_memsz = u64_at(image, ph + 40) as usize;
-        if p_offset + p_filesz > image.len() {
+        let p_paddr = u64_at(image, ph + 24);
+        let p_filesz = u64_at(image, ph + 32);
+        let p_memsz = u64_at(image, ph + 40);
+        if p_offset as u64 + p_filesz > image.len() as u64 {
             return Err(LoadError::UnsupportedElf);
         }
-        // SAFETY: identity-mapped ring-0 execution; destination addresses
-        // come from the link script and are owned by the loader.
+        let Some(seg_end) = p_paddr.checked_add(p_memsz) else {
+            return Err(LoadError::SegmentOutOfRange);
+        };
+        if p_paddr < APP_LOAD_BASE || seg_end > orbita_abi::APP_IMAGE_LIMIT {
+            return Err(LoadError::SegmentOutOfRange);
+        }
+        // SAFETY: identity-mapped execution; destination addresses are
+        // validated against the reserved region above.
         unsafe {
-            ptr::copy_nonoverlapping(image.as_ptr().add(p_offset), p_paddr as *mut u8, p_filesz);
+            ptr::copy_nonoverlapping(
+                image.as_ptr().add(p_offset),
+                p_paddr as *mut u8,
+                p_filesz as usize,
+            );
             // Zero the .bss tail beyond the file image.
-            ptr::write_bytes((p_paddr + p_filesz) as *mut u8, 0, p_memsz - p_filesz);
+            ptr::write_bytes(
+                (p_paddr + p_filesz) as *mut u8,
+                0,
+                (p_memsz - p_filesz) as usize,
+            );
         }
     }
     Ok(entry)

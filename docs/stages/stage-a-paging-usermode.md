@@ -333,3 +333,29 @@ Win64 callee-saved набор (RBX/RBP/R12-15 добавлены к RDI/RSI/XMM6
 kill-развязка перескакивает эпилог fault-обработчика, его рабочие
 регистры не должны утекать в ядро (вероятный корень fmt-after-kill
 фриза порции 8). 3 бута стабильны.
+
+### 2026-08-29 — порция 10: безопасность ELF-лоадера + hi-half kernel ✅
+
+**Сделано:**
+- `orbita-abi::APP_IMAGE_LIMIT` (0x10080000) — общий контракт границы
+  «линкованный образ | bump-heap SDK»; `RegionHeap::BASE` SDK теперь
+  ссылается на него.
+- `load_elf` (kernel/abi.rs) — **валидация безопасности**: entry и
+  каждый PT_LOAD (p_paddr..p_paddr+p_memsz, без overflow) обязаны
+  лежать в [APP_LOAD_BASE, APP_IMAGE_LIMIT) — крафтовый ORBEXEC больше
+  не может писать в память ядра через лоадер (`SegmentOutOfRange` /
+  `EntryOutOfRange`).
+- Негативный бут-тест: сгенерированный ELF с PT_LOAD на 0x1F000000 →
+  `elf: out-of-region segment rejected` (каждый бут, CI-маркер).
+- Hi-half алиас (A.2): 0..4GiB продублированы на
+  0xFFFF_8000_0000_0000 — каноническое kernel-окно, наследуемое всеми
+  user-PML4 (клонирование ent'ей != 0); проба `paging: hi-half alias
+  ok` после switch. Ядро пока исполняется на identity — hi-half как
+  структурный задел под A.2-завершение.
+
+**Тесты (3 бута):** hihalf=1 / elf-reject=1 / SECURITY-HOLE=0 /
+kill-ok=1 / ring3-приложения / boots=1 ×3; host 89/0; SDK unknown-none
+чист; доки чисты.
+
+**Дальше (порция 11):** перевод исполнения ядра в hi-half (полный
+A.2), fork/exec с раздельными регионами, per-CPU GS (A.9).

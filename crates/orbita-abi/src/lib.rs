@@ -170,3 +170,13 @@ impl SyscallReq {
         Self { nr: op, a1: 0, a2: 0, a3: 0, a4: 0, ret: 0 }
     }
 }
+
+/// Ceiling of the linked application image inside the user load region
+/// (`0x1000_0000 .. APP_IMAGE_LIMIT`): the SDK's bump heap starts exactly
+/// here, so the kernel loader must reject any ELF segment crossing it
+/// (an image that big would silently corrupt the application's own heap
+/// statics).
+///
+/// Shared contract between `orbita-build` (linker base), the kernel ELF
+/// loader and `orbita-sdk` (`RegionHeap::BASE`).
+pub const APP_IMAGE_LIMIT: u64 = 0x1008_0000;

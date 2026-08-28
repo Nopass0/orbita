@@ -183,6 +183,20 @@ pub(crate) fn build_full_address_space(
         return None;
     }
 
+    // (1b) Hi-half alias (roadmap A.2): the same low coverage at
+    // 0xFFFF_8000_0000_0000 — the canonical kernel window every address
+    // space inherits (user PML4s clone these supervisor entries).
+    // Structural prep for executing kernel code up there; today the
+    // kernel still runs at identity.
+    const HI_HALF_BASE: u64 = 0xFFFF_8000_0000_0000;
+    let mut at = 0u64;
+    while at < LOW_SPACE_TOP {
+        mapper
+            .map_2mib(&mut memory, Virt(HI_HALF_BASE + at), Phys(at), WRITABLE)
+            .ok()?;
+        at += PAGE_SIZE_2M;
+    }
+
     // (2) Descriptors above 4 GiB: high RAM and 64-bit MMIO windows.
     for region in regions {
         if region.end().0 <= LOW_SPACE_TOP {
@@ -261,6 +275,19 @@ pub(crate) fn maybe_switch_cr3(
                 cr4_before,
                 cr3_after
             ));
+            // Hi-half probe: the canonical kernel window (0xFFFF8000…)
+            // must translate back to the same physical page (alias).
+            {
+                let memory = KernelFrameMemory::new(allocator);
+                let mapper = PageTableMapper::new(report.pml4_phys);
+                let probe = Virt(0xFFFF_8000_0000_0000 + 0x1000_0000);
+                match mapper.translate(&memory, probe) {
+                    Some((Phys(phys), _)) if phys == 0x1000_0000 => {
+                        orbita_platform::log_line("paging: hi-half alias ok");
+                    }
+                    _ => orbita_platform::log_line("paging: hi-half alias MISSING"),
+                }
+            }
             true
         }
         None => {
@@ -488,6 +515,34 @@ pub(crate) fn maybe_ring3_selftest(
             let _ = serial.write_str(" (kernel alive)");
             serial.write_byte(b'\r');
             serial.write_byte(b'\n');
+        }
+    }
+
+    // Negative ELF-loader test (portion 10, security): a PT_LOAD aimed at
+    // kernel memory must be rejected before any byte is written.
+    let mut fake = [0u8; 128];
+    fake[..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
+    fake[4] = 2; // 64-bit
+    fake[5] = 1; // little-endian
+    fake[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+    fake[18..20].copy_from_slice(&0x3Eu16.to_le_bytes()); // x86_64
+    fake[24..32].copy_from_slice(&crate::abi::APP_LOAD_BASE.to_le_bytes()); // entry
+    fake[32..40].copy_from_slice(&64u64.to_le_bytes()); // phoff
+    fake[54..56].copy_from_slice(&56u16.to_le_bytes()); // phentsize
+    fake[56..58].copy_from_slice(&1u16.to_le_bytes()); // phnum
+    // One PT_LOAD at phoff 64: type=1, p_paddr=0x1F00_0000 (kernel RAM).
+    fake[64..68].copy_from_slice(&1u32.to_le_bytes());
+    fake[88..96].copy_from_slice(&0x1F00_0000u64.to_le_bytes());
+    fake[96..104].copy_from_slice(&16u64.to_le_bytes()); // filesz
+    fake[104..112].copy_from_slice(&16u64.to_le_bytes()); // memsz
+    match crate::abi::load_elf(&fake) {
+        Err(crate::abi::LoadError::SegmentOutOfRange) => {
+            orbita_platform::log_line("elf: out-of-region segment rejected");
+        }
+        other => {
+            orbita_platform::log_line_fmt(format_args!(
+                "elf: SECURITY HOLE — malicious segment accepted ({other:?})"
+            ));
         }
     }
 }
