@@ -11,7 +11,7 @@
 //! user-half, per-process tables) follows in portion 4.
 
 use orbita_mm::paging::{
-    FrameMemory, PageTableMapper, Phys, Virt, ENTRIES, PAGE_SIZE_2M, WRITABLE,
+    FrameMemory, PageTableMapper, Phys, Virt, ENTRIES, PAGE_SIZE_2M, USER, WRITABLE,
 };
 use orbita_mm::{BootstrapFrameAllocator, MemoryRegion, MemoryRegionKind};
 
@@ -266,5 +266,100 @@ pub(crate) fn maybe_switch_cr3(
             orbita_platform::log_line("paging: cr3 build FAILED (staying on firmware tables)");
             false
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage-A portion 6: ring-3 self-test.
+//
+// Proves the whole user-mode machinery in the live OS before the SDK
+// pipeline migrates to syscalls (roadmap A.4/A.5): GDT user segments +
+// TSS.rsp0, the syscall/sysret gate, and USER-flagged pages in the
+// kernel-built tables. A tiny position-independent stub runs in ring 3,
+// issues SYSCALL_ECHO (kernel answers, sysret back), then SYSCALL_DONE
+// which resumes the kernel context that entered the test.
+// ---------------------------------------------------------------------------
+
+/// Ring-3 stub machine code written to the app load base (25 bytes):
+/// ```text
+/// mov rax, SYSCALL_ECHO   ; 48 C7 C0 00 10 00 00
+/// mov rdi, 0x5A3CC35A     ; 48 C7 C7 5A C3 3C 5A   (SysV arg1 = magic)
+/// syscall                 ; 0F 05
+/// mov rax, SYSCALL_DONE   ; 48 C7 C0 01 10 00 00
+/// syscall                 ; 0F 05   (kernel resumes; never returns here)
+/// ```
+const RING3_STUB: [u8; 25] = [
+    0x48, 0xC7, 0xC0, 0x00, 0x10, 0x00, 0x00, // mov rax, 0x1000 (ECHO)
+    0x48, 0xC7, 0xC7, 0x5A, 0xC3, 0x3C, 0x5A, // mov rdi, magic
+    0x0F, 0x05, // syscall
+    0x48, 0xC7, 0xC0, 0x01, 0x10, 0x00, 0x00, // mov rax, 0x1001 (DONE)
+    0x0F, 0x05, // syscall
+];
+
+/// Run the ring-3 roundtrip when `ring3_test=on` and the kernel owns CR3.
+pub(crate) fn maybe_ring3_selftest(
+    allocator: &mut BootstrapFrameAllocator<'_>,
+    conf_text: &str,
+    kernel_tables: bool,
+) {
+    if !config::wants_ring3_test(conf_text) {
+        return;
+    }
+    if !kernel_tables {
+        orbita_platform::log_line("ring3: self-test skipped (kernel tables off)");
+        return;
+    }
+    const BASE: u64 = crate::abi::APP_LOAD_BASE; // 0x1000_0000, 1 MiB reserved
+    const REGION_PAGES: u64 = 256; // 256 * 4 KiB = the reserved app area
+
+    // Make the app region reachable from ring 3: replace the 2 MiB huge
+    // entry with 4 KiB pages carrying USER.
+    let mut memory = KernelFrameMemory::new(allocator);
+    // The mapper edits the LIVE tables (CR3 == our PML4 since the switch).
+    let mut mapper = PageTableMapper::new(orbita_arch_x86_64::cpu::read_cr3());
+    match mapper.unmap_page(&mut memory, Virt(BASE)) {
+        Ok(_) => {}
+        Err(err) => {
+            orbita_platform::log_line_fmt(format_args!(
+                "ring3: self-test aborted (unmap app region failed: {err:?})"
+            ));
+            return;
+        }
+    }
+    for page in 0..REGION_PAGES {
+        let at = BASE + page * orbita_mm::PAGE_SIZE as u64;
+        if mapper
+            .map_page(&mut memory, Virt(at), Phys(at), WRITABLE | USER)
+            .is_err()
+        {
+            orbita_platform::log_line("ring3: self-test aborted (USER remap failed)");
+            return;
+        }
+    }
+    orbita_platform::log_line_fmt(format_args!(
+        "ring3: app region USER-mapped ({} pages at 0x{BASE:x})",
+        REGION_PAGES
+    ));
+
+    // Write the stub + a user stack inside the region.
+    // SAFETY: the region is reserved loader memory, identity-mapped and
+    // now USER-accessible; the OS owns every byte of it.
+    unsafe {
+        core::ptr::copy_nonoverlapping(RING3_STUB.as_ptr(), BASE as *mut u8, RING3_STUB.len());
+        let user_rsp = BASE + REGION_PAGES * orbita_mm::PAGE_SIZE as u64 - 0x100;
+        orbita_platform::log_line("ring3: stub+stack ready, installing gate");
+        orbita_arch_x86_64::syscall::install_syscall_gate();
+        orbita_platform::log_line("ring3: gate installed, entering ring 3");
+        let ok = orbita_arch_x86_64::syscall::ring3_roundtrip(BASE, user_rsp);
+        orbita_platform::log_line("ring3: back in kernel after roundtrip");
+        // The syscall gate runs with IF cleared (FMASK); restore the
+        // kernel's pre-test interrupt state before continuing the boot.
+        orbita_arch_x86_64::cpu::enable_interrupts();
+        let count = orbita_arch_x86_64::syscall::syscall_count();
+        orbita_platform::log_line_fmt(format_args!(
+            "ring3: roundtrip ok={} syscalls={}",
+            ok == 0,
+            count
+        ));
     }
 }

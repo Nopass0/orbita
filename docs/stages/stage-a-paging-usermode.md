@@ -157,6 +157,57 @@ Host: workspace 84 passed / 0 failed.
 копируется в каждый новый PML4, identity-low остаётся на переход;
 затем GDT/TSS (IST1-3, user-сегменты) и syscall-шлюз (roadmap A.4/A.5).
 
+### 2026-08-28 — порция 6: GDT/TSS + syscall-шлюз + ring 3 self-test ✅
+
+**Сделано:**
+- `orbita-arch-x86_64/src/gdt.rs` (новый):
+  - кодировщик дескрипторов `encode_segment` (чистая логика, 5 host-тестов,
+    включая проверку аппаратных смещений TSS — тест поймал пропущенный
+    u64-reserved: sizeof был 96 вместо 104!);
+  - селекторы 0x08/0x10 (совместимы с bootstrap-IDT), 0x18/0x20/0x28
+    (user32/data/code64, RPL3: 0x23/0x2B — STAR-конвенция sysret),
+    0x30 (TSS64);
+  - `TaskStateSegment` (rsp0 + IST1..3 на статик-стеках 16K/4K);
+  - `install_kernel_gdt()`: lgdt + перезагрузка DS/ES/SS + CS через
+    `retfq` + ltr. **Грабли:** `push {0:x}` пушит 2 байта, а `retfq`
+    извлекает 16 — RSP уезжал на 6 байтов, стек каллера разрушался
+    (мусор в последующих println). Нужен qword-push.
+- `orbita-arch-x86_64/src/syscall.rs` (новый):
+  - MSR STAR/LSTAR/FMASK + EFER.SCE (rmw — не затирает NXE-состояние);
+  - asm-вход: сохранение user rsp/rcx/r11, переключение на отдельный
+    kernel-стек (16 KiB .bss), перемешивание аргументов SysV→Win64
+    (rdi/rsi → rdx/r8), вызов Rust-диспетчера, `sysretq`;
+  - SYSCALL_DONE-путь: восстановление сохранённого kernel-rsp + `ret`
+    (ring3-roundtrip возвращается в Rust-вызвавшего);
+  - `enter_ring3(rip, rsp)`: iretq-трамплин (SS=0x23, CS=0x2B, IF=1);
+  - v1-диспетчер: ECHO (0x1000) / DONE (0x1001) — SDK-миграция на
+    syscall-номера следующей порцией.
+- `orbita-kernel/src/paging_setup.rs`: `maybe_ring3_selftest` —
+  ремап app-региона 0x10000000 на 4 KiB USER-страницы (unmap huge +
+  256×map_page над ЖИВЫМ CR3), запись 25-байтового stub
+  (mov rax,ECHO; mov rdi,magic; syscall; …DONE; syscall), вход в
+  ring 3, `sti` после возврата; гейт `ring3_test=on` (default).
+- `main.rs`: GDT сразу после bootstrap-IDT + строка в boot-лог.
+
+**Тесты (QEMU q35/512M/smp4, 3 бута подряд):** все 16 smoke-маркеров ×3,
+`ring3: syscall echo received` → `done syscall — resuming kernel context`
+→ `ring3: roundtrip ok=true syscalls=2`, бут продолжается (orbitafs/
+process/vfs), boots=1, panic=0, fault=0. Host: 89 passed / 0 failed
+(+5 GDT). **Ring 3 + syscall/sysret доказаны в живой ОС** — вход iretq
+CS=0x2B, возврат sysretq, ядро продолжает бут.
+
+**Честно о граблях этой порции:** первый вариант фризился посреди
+println после roundtrip (рандомный RIP в PCI-дыре, кодген-чувствительно:
+ушло при выносе atomic-чтения из format_args + sti + доп. печати;
+root-cause до конца не доказан — оставлено под наблюдением, #PF/#GP-
+диагностика на страже). Intel-синтаксис LLVM: `;`-комментарии в
+global_asm невалидны (нужен `#`), `o64`-префикс не принимается
+(суффиксы `iretq`/`sysretq`/`retfq` работают).
+
+**Дальше (порция 7):** SDK-миграция на syscall-номера (ABI v2),
+ELF в user-адреса (база 0x400000, user-стек 0x7FFF…), `run` в ring3,
+#PF в user → kill процесса (roadmap A.5/A.6/A.7).
+
 ---
 
 *(шаблон порции: дата → Сделано/Тесты/Дальше; статусы: ⬜ planned,

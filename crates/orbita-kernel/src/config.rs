@@ -11,7 +11,7 @@ use crate::console::*;
 pub(crate) const ORBITA_CONF: &str = "/etc/orbita.conf";
 
 pub(crate) fn orbita_conf_default() -> &'static str {
-    "hostname=orbita\nmodules=full\nboot_splash=on\npaging_dry_run=on\npaging_cr3=on\n"
+    "hostname=orbita\nmodules=full\nboot_splash=on\npaging_dry_run=on\npaging_cr3=on\nring3_test=on\n"
 }
 
 /// Parses "key=value" lines.
@@ -115,4 +115,13 @@ pub(crate) fn wants_paging_cr3(text: &str) -> bool {
     parse_conf(text)
         .iter()
         .any(|(key, value)| key == "paging_cr3" && (value == "on" || value == "1"))
+}
+
+/// Whether `/etc/orbita.conf` enables the ring-3 self-test
+/// (`ring3_test=on`): USER-mapped stub + syscall/sysret roundtrip right
+/// after the CR3 switch (stage-A portion 6). Requires kernel tables.
+pub(crate) fn wants_ring3_test(text: &str) -> bool {
+    parse_conf(text)
+        .iter()
+        .any(|(key, value)| key == "ring3_test" && (value == "on" || value == "1"))
 }

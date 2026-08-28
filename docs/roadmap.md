@@ -115,8 +115,11 @@ mount.rs` — свои inode/extents/bitmap/superblock, host-тесты).
 
 ## Известные ограничения v1 (честно)
 
-1. **Приложения в ring0**, identity-mapped, стек 256KB,
-   Win64↔SysV мост. Любое приложение может уронить ядро.
+1. **Приложения в ring0** (identity-mapped, стек 256KB,
+   Win64↔SysV мост): машинерия ring 3 готова и доказана self-test'ом
+   (GDT/TSS/syscall-шлюз, порция 6), но конвейер приложений ещё не
+   переведён на syscall-номера и user-ELF (порция 7+). Любое
+   приложение всё ещё может уронить ядро.
 2. **Фактически один CPU**: `probe_smp()` (orbita-kernel/src/main.rs:324)
    только инвентаризирует топологию; `bring_up_aps()`
    (orbita-arch-x86_64/src/smp_ap.rs:157, INIT-SIPI-SIPI + trampoline
@@ -602,6 +605,13 @@ J — когда драйверная база готова; K — горизо�
   **CR3-переключение стабильно и включено по умолчанию** (cold+warm
   QEMU smoke), обработчики #PF/#GP/#DF с печатью rip/CR2/err в serial
   вместо silent triple fault; CI-маркер `paging: cr3 switched`.
+- Этап A, порция 6: GDT/TSS (kernel/user сегменты, rsp0+IST1..3,
+  5 host-тестов — тесты поймали пропущенный reserved в TSS),
+  syscall/sysret-шлюз (STAR/LSTAR/FMASK, EFER.SCE, отдельный kernel-
+  стек, мост SysV→Win64), **ring-3 self-test в живой ОС**: USER-ремап
+  app-региона, iretq→CS=0x2B, echo-syscall, sysret, DONE-возврат в
+  ядро; бут продолжается; CI-маркеры `gdt installed` +
+  `ring3: roundtrip ok=true syscalls=2`.
 
 - Модульное ядро: 23 крейта; main.rs разрезан на
   boot/console/config/disk/drivers/seed/ui/input/hosts/abi.

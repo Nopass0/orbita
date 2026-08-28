@@ -295,6 +295,10 @@ fn kernel_main(boot_info: BootInfo) -> ! {
     );
     let local_apic = probe_local_apic();
     let idt = install_bootstrap_idt();
+    // Stage-A portion 6: kernel/user GDT + TSS (rsp0/IST). Selectors are
+    // layout-compatible with the bootstrap IDT (0x08), so installing the
+    // GDT right after the IDT keeps every existing entry valid.
+    let gdt = orbita_arch_x86_64::gdt::install_kernel_gdt();
     register_handler(TIMER_VECTOR, on_timer_irq);
     register_handler(KEYBOARD_VECTOR, on_keyboard_irq);
     let interrupt_bootstrap = bootstrap_interrupts(local_apic, KEYBOARD_VECTOR);
@@ -313,6 +317,13 @@ fn kernel_main(boot_info: BootInfo) -> ! {
         idt.keyboard_vector,
         idt.spurious_vector,
         idt.fault_vectors
+    );
+    println!(
+        "Orbita OS: gdt installed selectors={} tss=0x{:x} rsp0=0x{:x} user_cs=0x{:x}",
+        gdt.selectors,
+        gdt.tss_address,
+        gdt.rsp0,
+        orbita_arch_x86_64::gdt::USER_CODE64_SELECTOR
     );
     println!(
         "Orbita OS: ioapic base=0x{:x} redirs={} keyboard_irq_line={} keyboard_vector={} masked={}",
@@ -575,13 +586,15 @@ fn kernel_main(boot_info: BootInfo) -> ! {
             );
             // Stage-A portion 4: switch CR3 to the kernel identity map.
             let fb = framebuffer.info;
-            paging_setup::maybe_switch_cr3(
+            let switched = paging_setup::maybe_switch_cr3(
                 &mut frame_allocator,
                 boot_info.memory_regions(),
                 Some((fb.base as u64, fb.size_bytes as u64)),
                 &[(local_apic.physical_base, 0x1000), (0xFEC0_0000, 0x1000)],
                 &conf_text,
             );
+            // Stage-A portion 6: ring-3 + syscall/sysret roundtrip.
+            paging_setup::maybe_ring3_selftest(&mut frame_allocator, &conf_text, switched);
             let kind = disk.inner.storage_kind().label();
             println!(
                 "Orbita OS: orbitafs medium={} capacity={} used={} ({}.{:02}%) boots={boots} files={} dirs={}",

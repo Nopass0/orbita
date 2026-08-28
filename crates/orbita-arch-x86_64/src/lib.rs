@@ -1,6 +1,8 @@
 #![no_std]
 
 pub mod smp_ap;
+pub mod gdt;
+pub mod syscall;
 
 pub mod cpu {
     use core::arch::{asm, global_asm};
