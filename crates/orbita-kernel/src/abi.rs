@@ -312,26 +312,56 @@ pub(crate) struct NativeRun {
 }
 
 /// Runs one ORBEXEC payload (ELF64) with the ABI installed.
+///
+/// `ring3 = true` executes the application as a user process: the ELF
+/// entry is reached via `iretq` (CS RPL 3) with a user stack inside the
+/// app region, and the EXIT syscall unwinds back with the exit code.
+/// Requires the app region to be USER-mapped (kernel tables + stage-A
+/// portion 6 remap).
 pub(crate) fn exec_native(
     fs: &mut MemoryVolume,
     net_info: String,
     payload: &[u8],
+    ring3: bool,
 ) -> Result<NativeRun, String> {
     let entry = load_elf(payload).map_err(|err| format!("run: elf loader rejected image ({err:?})"))?;
 
     ABI_FS.store(fs as *mut MemoryVolume, Ordering::Relaxed);
     *NET_INFO.lock() = net_info;
     STDOUT.lock().clear();
+    REPORTED_EXIT.store(i32::MIN, Ordering::Relaxed);
 
-    // Applications run on a dedicated kernel-heap stack: the boot UEFI
-    // stack is small and already deep at this point, and overflowing it
-    // corrupts kernel fmt structures.
+    if ring3 {
+        if !crate::paging_setup::app_region_is_user() {
+            ABI_FS.store(ptr::null_mut(), Ordering::Relaxed);
+            return Err(String::from("run: ring3 exec needs USER-mapped app region"));
+        }
+        RING3_EXEC.store(true, Ordering::Relaxed);
+        // SAFETY: the ELF was loaded into the USER-mapped region; the
+        // stack top stays inside it; the EXIT syscall resumes this frame.
+        let code = unsafe {
+            orbita_arch_x86_64::syscall::enter_ring3(entry, USER_STACK_TOP)
+        } as u32 as i32;
+        RING3_EXEC.store(false, Ordering::Relaxed);
+        if code == u32::MAX as i32 && REPORTED_EXIT.load(Ordering::Relaxed) == i32::MIN {
+            ABI_FS.store(ptr::null_mut(), Ordering::Relaxed);
+            return Err(String::from("run: ring3 process did not exit cleanly"));
+        }
+        let code = REPORTED_EXIT.load(Ordering::Relaxed);
+        ABI_FS.store(ptr::null_mut(), Ordering::Relaxed);
+        let lines = STDOUT.lock().drain(..).collect();
+        return Ok(NativeRun { code, stdout: lines });
+    }
+
+    // Ring-0 path: applications run on a dedicated kernel-heap stack (the
+    // boot UEFI stack is small and already deep at this point).
     const APP_STACK_SIZE: usize = 256 * 1024;
     let stack_layout =
         Layout::from_size_align(APP_STACK_SIZE, 16).expect("app stack layout");
     // SAFETY: kernel global allocator backs the stack.
     let stack = unsafe { alloc::alloc::alloc(stack_layout) };
     if stack.is_null() {
+        ABI_FS.store(ptr::null_mut(), Ordering::Relaxed);
         return Err(String::from("run: cannot allocate app stack"));
     }
     let stack_top = unsafe { stack.add(APP_STACK_SIZE) };
@@ -339,10 +369,15 @@ pub(crate) fn exec_native(
     // SAFETY: the entry point is the ELF's `orb_main` with the C ABI
     // signature `fn(*const OrbAbi) -> i32`; segments were loaded above.
     // The call switches RSP to the fresh stack and restores it after.
-    REPORTED_EXIT.store(i32::MIN, Ordering::Relaxed);
+    // Syscalls from this CPL0 execution must return via IRETQ (SYSRET
+    // would demote the app to ring 3 on kernel pages).
+    orbita_arch_x86_64::syscall::set_ring0_syscalls(true);
     let _rax_code: i32 = unsafe { call_with_stack(entry, &ABI_TABLE, stack_top as u64) };
+    orbita_arch_x86_64::syscall::set_ring0_syscalls(false);
     let code = REPORTED_EXIT.load(Ordering::Relaxed);
     if code == i32::MIN {
+        unsafe { alloc::alloc::dealloc(stack, stack_layout) };
+        ABI_FS.store(ptr::null_mut(), Ordering::Relaxed);
         return Err(String::from("run: application did not report an exit code"));
     }
 
@@ -389,6 +424,194 @@ static REPORTED_EXIT: AtomicI32 = AtomicI32::new(i32::MIN);
 
 extern "sysv64" fn abi_report_exit(code: i32) {
     REPORTED_EXIT.store(code, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// ABI v2: syscall transport (stage A, roadmap A.5/A.6).
+//
+// `syscall_entry` is registered as the gate dispatcher at boot. Ring-0
+// exec (autoruns before the CR3 switch) and ring-3 exec (user processes)
+// share it: the only difference is that EXIT terminates ring 3 via the
+// saved-context unwind while ring 0 merely records the code.
+// ---------------------------------------------------------------------------
+
+/// True while an application executes in ring 3 (EXIT unwinds instead of
+/// returning).
+static RING3_EXEC: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The user load region (validated for every syscall argument).
+const USER_REGION: core::ops::Range<u64> = APP_LOAD_BASE..APP_LOAD_BASE + 0x10_0000;
+
+/// User stack top inside the region (256 KiB below the region end);
+/// `| 8` mimics the post-`call` RSP alignment a normal entry would see.
+const USER_STACK_TOP: u64 = APP_LOAD_BASE + 0x10_0000 - 0x1000 - 8;
+
+fn user_range_ok(ptr: u64, len: u64) -> bool {
+    // Ring-0 execution (pre-switch autoruns) keeps its request blocks on
+    // the kernel-heap app stack — outside the user region but trusted
+    // kernel memory. Ring-3 requests must live in the user region.
+    if !RING3_EXEC.load(Ordering::Relaxed) {
+        return ptr != 0;
+    }
+    match ptr.checked_add(len) {
+        Some(end) => USER_REGION.contains(&ptr) && USER_REGION.contains(&(end - 1)),
+        None => false,
+    }
+}
+
+/// The kernel syscall dispatcher (registered into the arch gate).
+pub(crate) fn syscall_entry(nr: u64, a1: u64, _a2: u64, _a3: u64) -> u64 {
+    use orbita_abi::nr as op;
+    use orbita_abi::SyscallReq;
+
+    // The self-test pair keeps working with the kernel dispatcher
+    // installed (portion 6 protocol).
+    match nr {
+        orbita_arch_x86_64::syscall::SYSCALL_ECHO => {
+            orbita_platform::log_line("ring3: syscall echo received (kernel side)");
+            return a1.wrapping_add(1);
+        }
+        orbita_arch_x86_64::syscall::SYSCALL_DONE => {
+            orbita_platform::log_line("ring3: done syscall — resuming kernel context");
+            orbita_arch_x86_64::syscall::finish_ring3(0);
+            return 0;
+        }
+        _ => {}
+    }
+
+    // Every v2 op travels through a request block in the user region.
+    if !user_range_ok(a1, core::mem::size_of::<SyscallReq>() as u64) {
+        orbita_platform::log_line_fmt(format_args!(
+            "syscall: rejected req ptr 0x{a1:x} (outside user region)"
+        ));
+        return AbiStatus::InvalidArgument as u64;
+    }
+    // SAFETY: pointer validated against the user region above; the block
+    // is written by the SDK on the application stack.
+    let req = unsafe { &mut *(a1 as *mut SyscallReq) };
+    match nr {
+        op::STDOUT_WRITE => {
+            if user_range_ok(req.a1, req.a2) {
+                // SAFETY: validated user-range bytes.
+                let text = unsafe {
+                    core::str::from_utf8_unchecked(core::slice::from_raw_parts(
+                        req.a1 as *const u8,
+                        req.a2 as usize,
+                    ))
+                };
+                orbita_platform::log_line_fmt(format_args!("[app] {text}"));
+                STDOUT.lock().push(String::from(text));
+            }
+            0
+        }
+        op::FS_READ | op::FS_LIST => {
+            let Some(fs) = abi_fs() else {
+                return AbiStatus::Unsupported as i64 as u64;
+            };
+            if !user_range_ok(req.a1, req.a2) {
+                return AbiStatus::InvalidArgument as i64 as u64;
+            }
+            // SAFETY: validated user-range path bytes.
+            let path = unsafe {
+                core::str::from_utf8_unchecked(core::slice::from_raw_parts(
+                    req.a1 as *const u8,
+                    req.a2 as usize,
+                ))
+            };
+            let bytes: Vec<u8> = if nr == op::FS_READ {
+                match fs.read_file_path(path) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return AbiStatus::NotFound as i64 as u64,
+                }
+            } else {
+                match fs.list_path(path) {
+                    Ok(listing) => {
+                        let mut text = String::new();
+                        for entry in listing.entries {
+                            text.push_str(&entry.name);
+                            if entry.metadata.is_directory() {
+                                text.push('/');
+                            }
+                            text.push('\n');
+                        }
+                        text.into_bytes()
+                    }
+                    Err(_) => return AbiStatus::NotFound as i64 as u64,
+                }
+            };
+            if req.a3 == 0 {
+                // Probe call (no buffer): answer with the length.
+                return bytes.len() as u64;
+            }
+            if bytes.len() as u64 > req.a4 || !user_range_ok(req.a3, req.a4) {
+                return AbiStatus::BufferTooSmall as i64 as u64;
+            }
+            // SAFETY: validated user-range buffer of a4 bytes.
+            unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), req.a3 as *mut u8, bytes.len()) };
+            bytes.len() as u64
+        }
+        op::FS_WRITE => {
+            let Some(fs) = abi_fs() else {
+                return AbiStatus::Unsupported as i64 as u64;
+            };
+            if !user_range_ok(req.a1, req.a2) || !user_range_ok(req.a3, req.a4) {
+                return AbiStatus::InvalidArgument as i64 as u64;
+            }
+            // SAFETY: validated user-range bytes.
+            let path = unsafe {
+                core::str::from_utf8_unchecked(core::slice::from_raw_parts(
+                    req.a1 as *const u8,
+                    req.a2 as usize,
+                ))
+            };
+            // SAFETY: validated user-range bytes.
+            let data = unsafe { core::slice::from_raw_parts(req.a3 as *const u8, req.a4 as usize) };
+            status_of(fs.create_file_path(path, data)) as i64 as u64
+        }
+        op::FS_DELETE => {
+            let Some(fs) = abi_fs() else {
+                return AbiStatus::Unsupported as i64 as u64;
+            };
+            if !user_range_ok(req.a1, req.a2) {
+                return AbiStatus::InvalidArgument as i64 as u64;
+            }
+            // SAFETY: validated user-range path bytes.
+            let path = unsafe {
+                core::str::from_utf8_unchecked(core::slice::from_raw_parts(
+                    req.a1 as *const u8,
+                    req.a2 as usize,
+                ))
+            };
+            status_of(fs.remove_path(path)) as i64 as u64
+        }
+        op::TIME_MS => abi_time_ms(),
+        op::OS_INFO => fill_text_buf(&OS_INFO.lock().clone(), req),
+        op::NET_INTERFACES => fill_text_buf(&NET_INFO.lock().clone(), req),
+        op::EXIT => {
+            let code = req.a1 as u32 as i32;
+            REPORTED_EXIT.store(code, Ordering::Relaxed);
+            if RING3_EXEC.load(Ordering::Relaxed) {
+                orbita_platform::log_line_fmt(format_args!("[app] exit ring3 code={code}"));
+                orbita_arch_x86_64::syscall::finish_ring3(code as u64 as i64 as u64);
+            }
+            0
+        }
+        _ => AbiStatus::Unsupported as i64 as u64,
+    }
+}
+
+/// Copies `text` into the request buffer (`a1` = ptr, `a2` = cap):
+/// returns the needed length on probe, the copied length when it fits.
+fn fill_text_buf(text: &str, req: &orbita_abi::SyscallReq) -> u64 {
+    if req.a1 == 0 {
+        return text.len() as u64;
+    }
+    if !user_range_ok(req.a1, req.a2) || text.len() as u64 > req.a2 {
+        return AbiStatus::BufferTooSmall as i64 as u64;
+    }
+    // SAFETY: validated user-range buffer of a2 bytes.
+    unsafe { ptr::copy_nonoverlapping(text.as_ptr(), req.a1 as *mut u8, text.len()) };
+    text.len() as u64
 }
 
 /// Formats a duration in whole milliseconds (host-side helper reuse).

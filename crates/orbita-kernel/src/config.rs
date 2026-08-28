@@ -11,7 +11,7 @@ use crate::console::*;
 pub(crate) const ORBITA_CONF: &str = "/etc/orbita.conf";
 
 pub(crate) fn orbita_conf_default() -> &'static str {
-    "hostname=orbita\nmodules=full\nboot_splash=on\npaging_dry_run=on\npaging_cr3=on\nring3_test=on\n"
+    "hostname=orbita\nmodules=full\nboot_splash=on\npaging_dry_run=on\npaging_cr3=on\nring3_test=on\napps_ring3=on\n"
 }
 
 /// Parses "key=value" lines.
@@ -124,4 +124,13 @@ pub(crate) fn wants_ring3_test(text: &str) -> bool {
     parse_conf(text)
         .iter()
         .any(|(key, value)| key == "ring3_test" && (value == "on" || value == "1"))
+}
+
+/// Whether `/etc/orbita.conf` runs the boot autorun applications as
+/// ring-3 user processes (`apps_ring3=on`, stage-A portion 7). The
+/// pre-switch autorun pass stays ring 0 either way.
+pub(crate) fn wants_apps_ring3(text: &str) -> bool {
+    parse_conf(text)
+        .iter()
+        .any(|(key, value)| key == "apps_ring3" && (value == "on" || value == "1"))
 }

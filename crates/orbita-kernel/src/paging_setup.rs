@@ -296,6 +296,38 @@ const RING3_STUB: [u8; 25] = [
     0x0F, 0x05, // syscall
 ];
 
+/// Set once the app region carries USER pages (ring-3 exec requirement).
+static APP_REGION_USER: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether the app load region is USER-mapped (kernel tables only).
+pub(crate) fn app_region_is_user() -> bool {
+    APP_REGION_USER.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Replace the 2 MiB huge page over the app region with 4 KiB USER
+/// pages, so ring 3 can execute there. Live edit of the active tables.
+fn map_app_region_user(allocator: &mut BootstrapFrameAllocator<'_>) -> bool {
+    const BASE: u64 = crate::abi::APP_LOAD_BASE; // 0x1000_0000, 1 MiB reserved
+    const REGION_PAGES: u64 = 256; // 256 * 4 KiB = the reserved app area
+    let mut memory = KernelFrameMemory::new(allocator);
+    // The mapper edits the LIVE tables (CR3 == our PML4 since the switch).
+    let mut mapper = PageTableMapper::new(orbita_arch_x86_64::cpu::read_cr3());
+    if mapper.unmap_page(&mut memory, Virt(BASE)).is_err() {
+        return false;
+    }
+    for page in 0..REGION_PAGES {
+        let at = BASE + page * orbita_mm::PAGE_SIZE as u64;
+        if mapper
+            .map_page(&mut memory, Virt(at), Phys(at), WRITABLE | USER)
+            .is_err()
+        {
+            return false;
+        }
+    }
+    APP_REGION_USER.store(true, core::sync::atomic::Ordering::Relaxed);
+    true
+}
+
 /// Run the ring-3 roundtrip when `ring3_test=on` and the kernel owns CR3.
 pub(crate) fn maybe_ring3_selftest(
     allocator: &mut BootstrapFrameAllocator<'_>,
@@ -312,36 +344,15 @@ pub(crate) fn maybe_ring3_selftest(
     const BASE: u64 = crate::abi::APP_LOAD_BASE; // 0x1000_0000, 1 MiB reserved
     const REGION_PAGES: u64 = 256; // 256 * 4 KiB = the reserved app area
 
-    // Make the app region reachable from ring 3: replace the 2 MiB huge
-    // entry with 4 KiB pages carrying USER.
-    let mut memory = KernelFrameMemory::new(allocator);
-    // The mapper edits the LIVE tables (CR3 == our PML4 since the switch).
-    let mut mapper = PageTableMapper::new(orbita_arch_x86_64::cpu::read_cr3());
-    match mapper.unmap_page(&mut memory, Virt(BASE)) {
-        Ok(_) => {}
-        Err(err) => {
-            orbita_platform::log_line_fmt(format_args!(
-                "ring3: self-test aborted (unmap app region failed: {err:?})"
-            ));
-            return;
-        }
-    }
-    for page in 0..REGION_PAGES {
-        let at = BASE + page * orbita_mm::PAGE_SIZE as u64;
-        if mapper
-            .map_page(&mut memory, Virt(at), Phys(at), WRITABLE | USER)
-            .is_err()
-        {
-            orbita_platform::log_line("ring3: self-test aborted (USER remap failed)");
-            return;
-        }
+    if !map_app_region_user(allocator) {
+        orbita_platform::log_line("ring3: self-test aborted (USER remap failed)");
+        return;
     }
     orbita_platform::log_line_fmt(format_args!(
         "ring3: app region USER-mapped ({} pages at 0x{BASE:x})",
         REGION_PAGES
     ));
 
-    // Write the stub + a user stack inside the region.
     // SAFETY: the region is reserved loader memory, identity-mapped and
     // now USER-accessible; the OS owns every byte of it.
     unsafe {

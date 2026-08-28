@@ -36,9 +36,11 @@ pub mod abi;
 pub mod sys;
 
 /// Entry-point generator: wraps `fn main() -> i32` in the C-ABI
-/// `orb_main` the kernel loader calls, installing the ABI table first.
+/// `orb_main` the kernel loader calls.
 ///
 /// A code passed to [`sys::process::exit`] overrides the returned value.
+/// The final EXIT syscall terminates ring-3 execution immediately (and
+/// merely records the code for the ring-0 exec path).
 #[macro_export]
 macro_rules! entry {
     (fn main() -> i32 $body:block) => {
@@ -47,7 +49,7 @@ macro_rules! entry {
             unsafe { $crate::abi::install(abi) };
             let returned: i32 = $body;
             let code = $crate::abi::take_exit_code().unwrap_or(returned);
-            ($crate::abi::table().report_exit)(code);
+            let _ = $crate::abi::call($crate::abi::nr::EXIT, code as u32 as u64, 0, 0, 0);
             code
         }
     };
@@ -70,15 +72,17 @@ macro_rules! println {
     };
 }
 
-/// Application panic handler: report through stdout, then halt.
-#[cfg(not(test))]
+/// Application panic handler: report through stdout, then exit.
 ///
-/// v1 limitation: panics halt the system (no unwinding across the ABI);
-/// user-mode processes (see `docs/roadmap.md`) fix this properly.
+/// In ring 3 the EXIT syscall unwinds into the kernel, which continues
+/// the boot/shell loop — an application panic no longer hangs the OS
+/// (stage A, roadmap A.7). The ring-0 exec path still spins afterwards
+/// (documented v1 limitation).
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     crate::abi::stdout_line(&crate::__format(format_args!("app panic: {info}")));
+    crate::sys::process::exit(-1);
     loop {
         core::hint::spin_loop();
     }

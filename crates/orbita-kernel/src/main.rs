@@ -299,6 +299,10 @@ fn kernel_main(boot_info: BootInfo) -> ! {
     // layout-compatible with the bootstrap IDT (0x08), so installing the
     // GDT right after the IDT keeps every existing entry valid.
     let gdt = orbita_arch_x86_64::gdt::install_kernel_gdt();
+    // Stage-A portion 7: the syscall gate serves ABI v2 for both ring-0
+    // and ring-3 execution; the kernel dispatcher owns the ops.
+    orbita_arch_x86_64::syscall::install_syscall_gate();
+    orbita_arch_x86_64::syscall::set_dispatcher(Some(abi::syscall_entry));
     register_handler(TIMER_VECTOR, on_timer_irq);
     register_handler(KEYBOARD_VECTOR, on_keyboard_irq);
     let interrupt_bootstrap = bootstrap_interrupts(local_apic, KEYBOARD_VECTOR);
@@ -530,7 +534,7 @@ fn kernel_main(boot_info: BootInfo) -> ! {
                             let target = alloc::format!("/apps/{}", entry.name);
                             let _ = shell_fs.create_file_path(&target, &bytes);
                             let net_info = net_stack.summary();
-                            match abi::exec_native(&mut shell_fs, net_info, binary.payload()) {
+                            match abi::exec_native(&mut shell_fs, net_info, binary.payload(), false) {
                                 Ok(run) => println!(
                                     "Orbita OS: autorun {} exit={}",
                                     binary.name(),
@@ -595,6 +599,31 @@ fn kernel_main(boot_info: BootInfo) -> ! {
             );
             // Stage-A portion 6: ring-3 + syscall/sysret roundtrip.
             paging_setup::maybe_ring3_selftest(&mut frame_allocator, &conf_text, switched);
+            // Stage-A portion 7: re-run every installed app as a ring-3
+            // user process (the first autorun pass ran on ring 0 before
+            // the kernel tables existed). Proves `run` isolation per boot.
+            if switched && config::wants_apps_ring3(&conf_text) {
+                if let Ok(apps) = shell_fs.list_path("/apps") {
+                    for entry in apps.entries {
+                        let path = alloc::format!("/apps/{}", entry.name);
+                        let Ok(bytes) = shell_fs.read_file_path(&path) else {
+                            continue;
+                        };
+                        let Ok(binary) = orbita_process::OrbExec::parse(&bytes) else {
+                            continue;
+                        };
+                        let net_info = net_stack.summary();
+                        match abi::exec_native(&mut shell_fs, net_info, binary.payload(), true) {
+                            Ok(run) => println!(
+                                "Orbita OS: autorun3 {} exit={} ring3",
+                                binary.name(),
+                                run.code
+                            ),
+                            Err(err) => println!("Orbita OS: autorun3 {} failed: {err}", binary.name()),
+                        }
+                    }
+                }
+            }
             let kind = disk.inner.storage_kind().label();
             println!(
                 "Orbita OS: orbitafs medium={} capacity={} used={} ({}.{:02}%) boots={boots} files={} dirs={}",

@@ -1,23 +1,22 @@
-//! Kernel/OS information.
+//! Kernel/OS information (ABI v2 syscall transport).
+use alloc::string::String;
+use alloc::vec::Vec;
+#[allow(unused_imports)]
 use alloc::vec;
 
-use alloc::string::String;
-
-use crate::abi::{self, AbiStatus};
+use crate::abi::{self, nr};
 
 /// Kernel/OS summary (version, renderer, memory, CPUs).
 pub fn info() -> String {
-    let mut length = 0usize;
-    let status = (abi::table().os_info)(core::ptr::null_mut(), 0, &mut length);
-    if status != AbiStatus::BufferTooSmall as i32 {
+    let probe = abi::call(nr::OS_INFO, 0, 0, 0, 0) as i64;
+    if probe < 0 {
         return String::new();
     }
-    let mut buffer = vec![0u8; length];
-    let mut filled = 0usize;
-    let status = (abi::table().os_info)(buffer.as_mut_ptr(), length, &mut filled);
-    if status != AbiStatus::Ok as i32 {
+    let mut buffer: Vec<u8> = vec![0u8; probe as usize];
+    let filled = abi::call(nr::OS_INFO, buffer.as_mut_ptr() as u64, buffer.len() as u64, 0, 0) as i64;
+    if filled < 0 {
         return String::new();
     }
-    buffer.truncate(filled);
+    buffer.truncate(filled as usize);
     String::from_utf8_lossy(&buffer).into_owned()
 }

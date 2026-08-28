@@ -208,6 +208,51 @@ global_asm невалидны (нужен `#`), `o64`-префикс не при
 ELF в user-адреса (база 0x400000, user-стек 0x7FFF…), `run` в ring3,
 #PF в user → kill процесса (roadmap A.5/A.6/A.7).
 
+### 2026-08-28 — порция 7: приложения в ring 3 (SDK на syscall'ах) ✅
+
+**Сделано:**
+- `orbita-abi`: транспорт ABI v2 — `SyscallReq`-блок (nr + 4 аргумента +
+  ret, rdi = указатель на блок) + номера операций (`nr::STDOUT_WRITE`,
+  `FS_READ/WRITE/LIST/DELETE`, `TIME_MS`, `OS_INFO`, `NET_INTERFACES`,
+  `EXIT`).
+- `orbita-arch-x86_64/syscall.rs`:
+  - перегружаемый диспетчер (`set_dispatcher`) — ядро ставит свой;
+  - флаг ring0-возврата: **SYSRET всегда возвращается в ring 3**, поэтому
+    syscall из CPL0 (pre-switch автораны) возвращается `popfq; jmp rcx`;
+  - флаг завершения ring3 (`finish_ring3`) — EXIT разворачивает
+    исполнение в сохранённый контекст ядра, rax = код выхода;
+  - enter_ring3 сохраняет/восстанавливает **RDI/RSI + XMM6-15** —
+    Win64-callee-saved, но SysV-volatile: приложение их трёт, ядро
+    после возврата жило с мусорными регистрами (#GP на первом же
+    format!/аллокации — найдено дампом байтов из fault-обработчика).
+- `orbita-sdk`: весь `sys` переведён на syscall-транспорт (таблица
+  игнорируется — один бинарь работает и в ring0, и в ring3); heap —
+  bump-аллокатор в user-регионе (0x10080000, 256 KiB); panic печатает
+  и делает exit(-1) — в ring3 паника приложения больше не вешает ОС.
+- `orbita-kernel/abi.rs`: `syscall_entry` — полный диспетчер над теми же
+  глобалами (fs/stdout/os/net/time/exit) с валидацией указателей
+  req/буферов по user-региону (в ring3; ring0 — доверие ядровой памяти);
+  `exec_native(..., ring3)` — ELF грузится в USER-регион, user-стек
+  в его вершине (0x100FFFF8), вход `enter_ring3`, выход по EXIT.
+- `main.rs`: шлюз+диспетчер ставятся сразу после GDT (syscalls работают
+  уже в ring0-авторанах); второй проход autorun (**autorun3**) после
+  CR3-switch гоняет все установленные приложения в ring3 (`apps_ring3=on`
+  в конфиге); `run` из shell'а тоже ring3 (fallback ring0).
+
+**Тесты (QEMU q35/512M/smp4, 3 бута):** `autorun3 hello exit=0 ring3` +
+`autorun3 sysinfo exit=0 ring3` ×3, boots=1, faults=0, все прежние
+маркеры; host 89/0; SDK `cargo check` под unknown-none чист.
+
+**Грабли порции (все — в логах выше, кратко):** syscall из CPL0 →
+sysret демотирует в ring3 на kernel-страницах (#PF err=0x5 пойман
+хендлером); Rust-атомик и asm-символ = «две переменные» (писали в одну,
+читали из другой — корень загадочного фриза порции 6!); Intel-синтаксис:
+`qword ptr`, `#`-комментарии; RDI/RSI Win64-callee-saved.
+
+**Дальше (порция 8):** #PF/#GP в ring3 → kill процесса (не halt ядра),
+ядро продолжает (roadmap A.7); fork/exec per-process PML4; kernel-half
+0xFFFF8000…; sdk-стек глубже/ворот больше 3 аргументов.
+
 ---
 
 *(шаблон порции: дата → Сделано/Тесты/Дальше; статусы: ⬜ planned,

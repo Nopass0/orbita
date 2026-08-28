@@ -114,3 +114,59 @@ pub struct OrbAbi {
 // The table is plain shared data; both sides only read function pointers.
 unsafe impl Send for OrbAbi {}
 unsafe impl Sync for OrbAbi {}
+
+// ---------------------------------------------------------------------------
+// ABI v2: syscall transport (stage A, roadmap A.5).
+//
+// Ring-3 applications reach the kernel through the `syscall` instruction
+// instead of the function table (which is inherently a ring-0 construct:
+// it hands kernel code pointers to untrusted code). One register argument
+// travels per syscall: `rdi` = pointer to a [`SyscallReq`] block owned by
+// the caller; the kernel fills `ret`. The block must live in the
+// application's user-mapped region — the kernel validates the pointer
+// range before dereferencing.
+// ---------------------------------------------------------------------------
+
+/// Syscall operation numbers (ABI v2 transport).
+pub mod nr {
+    /// Emit one stdout line: `a1` = bytes ptr, `a2` = len.
+    pub const STDOUT_WRITE: u64 = 1;
+    /// Read a file: `a1`/`a2` = path ptr/len, `a3` = buf, `a4` = cap.
+    /// `ret` = byte length, or negative status.
+    pub const FS_READ: u64 = 2;
+    /// Write a file: `a1`/`a2` = path ptr/len, `a3` = data ptr, `a4` = len.
+    pub const FS_WRITE: u64 = 3;
+    /// List a directory: like [`FS_READ`], entries `\n`-separated.
+    pub const FS_LIST: u64 = 4;
+    /// Delete a path: `a1`/`a2` = path ptr/len.
+    pub const FS_DELETE: u64 = 5;
+    /// Monotonic milliseconds since boot. `ret` = value.
+    pub const TIME_MS: u64 = 8;
+    /// OS summary: `a1` = buf, `a2` = cap. `ret` = length or negative status.
+    pub const OS_INFO: u64 = 9;
+    /// Network interface summary: `a1` = buf, `a2` = cap.
+    pub const NET_INTERFACES: u64 = 10;
+    /// Terminate the application: `a1` = exit code. Does not return.
+    pub const EXIT: u64 = 11;
+}
+
+/// Register-level syscall request block (one per call, on the caller stack).
+#[repr(C)]
+pub struct SyscallReq {
+    /// Operation: one of [`nr`].
+    pub nr: u64,
+    /// Operation arguments (pointers are user-region addresses).
+    pub a1: u64,
+    pub a2: u64,
+    pub a3: u64,
+    pub a4: u64,
+    /// Return value filled by the kernel.
+    pub ret: u64,
+}
+
+impl SyscallReq {
+    /// Fresh request for `op`.
+    pub const fn new(op: u64) -> Self {
+        Self { nr: op, a1: 0, a2: 0, a3: 0, a4: 0, ret: 0 }
+    }
+}

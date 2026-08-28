@@ -50,7 +50,10 @@ impl orbita_shell::ShellHost for KernelShellHost<'_> {
         let binary = orbita_process::OrbExec::parse(&bytes)
             .map_err(|_| format!("run: {path} is not a valid ORBEXEC binary"))?;
         let net_info = self.net_stack.summary();
-        let run = crate::abi::exec_native(fs, net_info, binary.payload())?;
+        // `run` executes as a ring-3 user process when the app region is
+        // USER-mapped (post stage-A switch); falls back to ring 0.
+        let ring3 = crate::paging_setup::app_region_is_user();
+        let run = crate::abi::exec_native(fs, net_info, binary.payload(), ring3)?;
         let output = run.stdout.join("\n");
         println!("Orbita OS: app {} exited with code {}", binary.name(), run.code);
         Ok((run.code, output))

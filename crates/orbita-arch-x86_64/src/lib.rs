@@ -117,6 +117,20 @@ pub mod cpu {
         }
     }
 
+    /// Dumps `count` bytes at `addr` as hex (diagnostics; faults on
+    /// unmapped memory are possible and acceptable here — the handler
+    /// is already fatal).
+    fn dump_bytes(out: &mut impl core::fmt::Write, addr: u64, count: usize) {
+        // SAFETY: best-effort diagnostic read in a fatal handler.
+        let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, count) };
+        for byte in bytes {
+            const DIGITS: &[u8; 16] = b"0123456789abcdef";
+            let _ = out.write_char(DIGITS[(byte >> 4) as usize] as char);
+            let _ = out.write_char(DIGITS[(byte & 0xF) as usize] as char);
+            let _ = out.write_char(' ');
+        }
+    }
+
     /// Entry called by the CPU-fault stubs. Prints the fault to the serial
     /// console (port I/O only — safe even with broken paging) and halts.
     /// Stage-A v1: any kernel-side fault is fatal; killing the faulting
@@ -139,6 +153,16 @@ pub mod cpu {
         write_hex(&mut serial, frame.cs & 0xFFFF);
         let _ = serial.write_str(" rsp=0x");
         write_hex(&mut serial, frame.rsp);
+        let _ = serial.write_str(" code=");
+        // SAFETY: best-effort diagnostic in a fatal handler.
+        if frame.rip >= 0x1000 {
+            dump_bytes(&mut serial, frame.rip, 16);
+        }
+        let _ = serial.write_str(" stack=");
+        // SAFETY: best-effort diagnostic in a fatal handler.
+        if frame.rsp >= 0x1000 {
+            dump_bytes(&mut serial, frame.rsp, 32);
+        }
         serial.write_byte(b'\r');
         serial.write_byte(b'\n');
         halt_forever()

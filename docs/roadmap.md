@@ -115,20 +115,21 @@ mount.rs` — свои inode/extents/bitmap/superblock, host-тесты).
 
 ## Известные ограничения v1 (честно)
 
-1. **Приложения в ring0** (identity-mapped, стек 256KB,
-   Win64↔SysV мост): машинерия ring 3 готова и доказана self-test'ом
-   (GDT/TSS/syscall-шлюз, порция 6), но конвейер приложений ещё не
-   переведён на syscall-номера и user-ELF (порция 7+). Любое
-   приложение всё ещё может уронить ядро.
+1. **Приложения в ring0 — СНЯТО частично (порция 7)**: hello и sysinfo
+   исполняются в **ring 3** (iretq CS=0x2B, syscall-шлюз ABI v2, EXIT-
+   развязка, `apps_ring3=on` по умолчанию; CI-маркеры autorun3).
+   Осталось: #PF в ring3 → kill процесса (сейчас halt ядра с
+   диагностикой), per-process адресные пространства, user-ELF по
+   стандартной базе 0x400000 (сейчас identity-регион 0x10000000).
 2. **Фактически один CPU**: `probe_smp()` (orbita-kernel/src/main.rs:324)
    только инвентаризирует топологию; `bring_up_aps()`
    (orbita-arch-x86_64/src/smp_ap.rs:157, INIT-SIPI-SIPI + trampoline
    16→64-бит) вызывается лишь при `smp=1` в /etc/orbita.conf, и на
    OVMF/QEMU AP не выходят из park — исполняется только BSP.
-3. **Паника приложения вешает ядро**: panic-handler SDK печатает и
-   spin-ится; перехвата паник нет. #GP/#PF/#DF обрабатываются (печать
-   rip/CR2/err + halt вместо triple fault — этап A, порция 5), но
-   убийство процесса по fault ещё не реализовано (нужно ring 3).
+3. **Паника приложения в ring0-пути**: SDK panic печатает и exit'ит —
+   в ring3 ядро продолжает (порция 7); в ring0 (pre-switch автораны)
+   всё ещё spin. #PF/#GP в ring3 сейчас = halt ядра с диагностикой;
+   kill процесса по fault — порция 8 (roadmap A.7).
 4. **TCP без state machine** — только parse/build сегментов, коннектов нет.
 5. **Пейджинг — только identity-карта ядра** (этап A, порции 1–5):
    CR3 переключается на собственные таблицы (0..4GiB + дескрипторы выше),
@@ -660,3 +661,10 @@ flowchart LR
     F --> UX[UX уровня Windows]
     C --> UX
 ```
+- Этап A, порция 7: **приложения в ring 3** — ABI v2 syscall-транспорт
+  (`SyscallReq`-блок, rax=nr/rdi=ptr), SDK полностью на syscall'ах
+  (один бинарь — ring0 и ring3), bump-heap в user-регионе, panic=exit;
+  `exec_native(ring3)` — ELF в USER-регионе, user-стек, EXIT-развязка
+  с сохранением RDI/RSI/XMM6-15 (Win64-callee-saved vs SysV-volatile);
+  второй autorun-проход в ring3 (`autorun3 … exit=0 ring3`, CI-маркеры);
+  syscall из CPL0 возвращается popfq+jmp (SYSRET всегда ring3).

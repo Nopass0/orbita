@@ -1,6 +1,7 @@
-//! Application process services: stdout and exit codes.
+//! Application process services: stdout and exit codes (ABI v2 syscall
+//! transport).
 
-use crate::abi;
+use crate::abi::{self, nr};
 
 /// Handle to the application's stdout stream.
 pub struct Stdout;
@@ -19,9 +20,10 @@ pub fn stdout() -> Stdout {
 
 /// Record the process exit code and finish.
 ///
-/// v1 note: execution still unwinds to the end of `main` normally
-/// (there is no preemptive process kill yet); the recorded code
-/// overrides `main`'s return value.
+/// In ring 3 the EXIT syscall terminates the process immediately (the
+/// kernel resumes its own context); the ring-0 exec path only records
+/// the code and returns, so `main` keeps running to its end.
 pub fn exit(code: i32) {
     abi::set_exit_code(code);
+    let _ = abi::call(nr::EXIT, code as u32 as u64, 0, 0, 0);
 }

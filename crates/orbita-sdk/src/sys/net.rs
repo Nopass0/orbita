@@ -5,10 +5,11 @@
 //! revision — see `docs/roadmap.md`.
 
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
+#[allow(unused_imports)]
+use alloc::vec;
 
-use crate::abi::{self, AbiStatus};
+use crate::abi::{self, nr};
 
 /// One network interface as reported by the kernel.
 #[derive(Debug, Clone)]
@@ -18,18 +19,17 @@ pub struct InterfaceInfo {
 
 /// List the live network interfaces.
 pub fn interfaces() -> Vec<InterfaceInfo> {
-    let mut length = 0usize;
-    let status = (abi::table().net_interfaces)(core::ptr::null_mut(), 0, &mut length);
-    if status != AbiStatus::BufferTooSmall as i32 {
+    let probe = abi::call(nr::NET_INTERFACES, 0, 0, 0, 0) as i64;
+    if probe < 0 {
         return Vec::new();
     }
-    let mut buffer = vec![0u8; length];
-    let mut filled = 0usize;
-    let status = (abi::table().net_interfaces)(buffer.as_mut_ptr(), length, &mut filled);
-    if status != AbiStatus::Ok as i32 {
+    let mut buffer: Vec<u8> = vec![0u8; probe as usize];
+    let filled =
+        abi::call(nr::NET_INTERFACES, buffer.as_mut_ptr() as u64, buffer.len() as u64, 0, 0) as i64;
+    if filled < 0 {
         return Vec::new();
     }
-    buffer.truncate(filled);
+    buffer.truncate(filled as usize);
     let text = String::from_utf8_lossy(&buffer).into_owned();
     text.lines()
         .filter(|line| !line.is_empty())

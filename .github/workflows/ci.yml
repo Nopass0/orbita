@@ -135,7 +135,9 @@ jobs:
           check "autorun sysinfo exit=0"
           check "paging: cr3 switched"
           check "gdt installed"
-          check "ring3: roundtrip ok=true syscalls=2"
+          check "ring3: roundtrip ok=true"
+          check "autorun3 hello exit=0 ring3"
+          check "autorun3 sysinfo exit=0 ring3"
           BOOTS=$(grep -ac "UEFI entry reached" smoke.log || true)
           if [ "$BOOTS" -ne 1 ]; then echo "BOOT CYCLES: $BOOTS (expected 1)"; exit 1; fi
           if grep -aq "panic" smoke.log; then echo "PANIC FOUND"; exit 1; fi
