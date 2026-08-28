@@ -64,8 +64,13 @@ cargo doc --no-deps --workspace --exclude orbita-kernel
 UEFI entry reached | drivers registered=3 bound=3 | e1000 up |
 esp fat mounted | pkg delivery staged 2 | [app] hello from a native rust app |
 [app] read back: | == orbita sysinfo == | autorun hello exit=0 |
-autorun sysinfo exit=0 | vfs bridge up | process spawned
+autorun sysinfo exit=0 | paging: cr3 switched | gdt installed |
+ring3: roundtrip ok=true | fault-kill ok=true |
+autorun3 hello exit=0 ring3 | autorun3 sysinfo exit=0 ring3 |
+vfs bridge up | process spawned
 ```
+(этап A: собственные таблицы ядра в CR3, ring-3 приложения на syscall-шлюзе,
+намеренная #PF-проба убивает процесс — ядро продолжает.)
 Команда QEMU — см. `.github/workflows/ci.yml` (job `qemu-smoke`) или
 `scripts/qemu-run.cmd` (без `-display none`).
 
