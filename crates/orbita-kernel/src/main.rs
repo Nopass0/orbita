@@ -748,6 +748,35 @@ fn kernel_main(boot_info: BootInfo) -> ! {
         load_persistent_into_ram(diskfs, disk, &mut shell_fs);
         let entries = diskfs.list_dir("/bin").map(|v| v.len()).unwrap_or(0);
         println!("Orbita OS: vfs bridge up, /bin visible to shell ({} entries)", entries);
+        // Scripting-language demo (docs/scripting.md): /etc/demo.sh runs
+        // with the same commands as the interactive shell — proves
+        // if/for/test/&& in the live OS on every boot.
+        struct ScriptEcho<'a>(&'a mut BootConsole);
+        impl orbita_shell::ShellOutput for ScriptEcho<'_> {
+            fn write_line(&mut self, line: &str) {
+                println!("{line}");
+                self.0.push_line(line);
+            }
+            fn set_status(&mut self, status: &str) {
+                self.0.set_status(status);
+            }
+            fn clear(&mut self) {
+                self.0.clear();
+            }
+        }
+        let script_runtime = orbita_shell::ShellRuntime::new();
+        let mut script_env = orbita_shell::ShellEnvironment::new(
+            orbita_shell::ShellSystemInfo::new("orbita", "demo", "", "", 1),
+        );
+        let mut script_host = orbita_shell::NoopShellHost;
+        let mut script_output = ScriptEcho(&mut console);
+        script_runtime.execute_line(
+            &mut script_env,
+            &mut shell_fs,
+            &mut script_output,
+            &mut script_host,
+            "sh /etc/demo.sh",
+        );
     }
 
     console.push_line("Orbita Console ready.");

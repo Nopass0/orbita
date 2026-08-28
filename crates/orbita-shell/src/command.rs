@@ -134,17 +134,36 @@ impl SimpleCommand {
     }
 }
 
+/// How a pipeline joins the previous one in a statement chain
+/// (`a && b`, `a || b`).
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
+pub enum Connector {
+    /// Always run (statement start or `;` separated).
+    #[default]
+    Always,
+    /// `&&`: run only when the previous pipeline exited 0.
+    And,
+    /// `||`: run only when the previous pipeline exited non-zero.
+    Or,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CommandPipeline {
     pub commands: Vec<SimpleCommand>,
+    /// Chain relation to the previous pipeline (scripting language).
+    pub connector: Connector,
 }
 
 impl CommandPipeline {
     pub fn new() -> Self {
-        Self { commands: Vec::new() }
+        Self {
+            commands: Vec::new(),
+            connector: Connector::Always,
+        }
     }
 }
 
+/// A parsed statement stream: pipelines joined by `;`, `&&` or `||`.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ShellScript {
     pub pipelines: Vec<CommandPipeline>,

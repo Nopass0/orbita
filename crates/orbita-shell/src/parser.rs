@@ -2,7 +2,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::command::{
-    CommandArg, CommandLine, CommandName, CommandPipeline, ParsedCommand, RedirectKind,
+    CommandArg, CommandLine, CommandName, CommandPipeline, Connector, ParsedCommand, RedirectKind,
     RedirectSpec, ShellAssignment, ShellScript, SimpleCommand,
 };
 
@@ -43,6 +43,7 @@ impl ShellParser {
         Ok(ParsedCommand::new(input.to_string(), line))
     }
 
+    #[allow(unused_assignments)] // the finish_pipeline! macro reassigns builders
     pub fn parse_script(&self, input: &str) -> Result<ShellScript, ParseError> {
         let tokens = tokenize(input)?;
         if tokens.is_empty() {
@@ -54,6 +55,21 @@ impl ShellParser {
         let mut command = SimpleCommand::new();
         let mut saw_token = false;
         let mut index = 0usize;
+        let mut pending_connector = Connector::Always;
+
+        macro_rules! finish_pipeline {
+            () => {
+                if !command.is_empty() {
+                    pipeline.commands.push(command);
+                    command = SimpleCommand::new();
+                }
+                if !pipeline.commands.is_empty() {
+                    pipeline.connector = pending_connector;
+                    script.pipelines.push(pipeline);
+                    pipeline = CommandPipeline::new();
+                }
+            };
+        }
 
         while index < tokens.len() {
             match &tokens[index] {
@@ -88,26 +104,26 @@ impl ShellParser {
                     pipeline.commands.push(command);
                     command = SimpleCommand::new();
                 }
+                Token::AndAnd | Token::OrOr => {
+                    if command.is_empty() && pipeline.commands.is_empty() {
+                        return Err(ParseError::UnexpectedPipe);
+                    }
+                    saw_token = true;
+                    finish_pipeline!();
+                    pending_connector = match &tokens[index] {
+                        Token::AndAnd => Connector::And,
+                        _ => Connector::Or,
+                    };
+                }
                 Token::Separator => {
-                    if !command.is_empty() {
-                        pipeline.commands.push(command);
-                        command = SimpleCommand::new();
-                    }
-                    if !pipeline.commands.is_empty() {
-                        script.pipelines.push(pipeline);
-                        pipeline = CommandPipeline::new();
-                    }
+                    finish_pipeline!();
+                    pending_connector = Connector::Always;
                 }
             }
             index += 1;
         }
 
-        if !command.is_empty() {
-            pipeline.commands.push(command);
-        }
-        if !pipeline.commands.is_empty() {
-            script.pipelines.push(pipeline);
-        }
+        finish_pipeline!();
 
         if !saw_token || script.pipelines.is_empty() {
             return Err(ParseError::Empty);
@@ -128,6 +144,8 @@ enum Token {
     Word(CommandArg),
     Redirect(RedirectKind),
     Pipe,
+    AndAnd,
+    OrOr,
     Separator,
 }
 
@@ -199,7 +217,23 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
             }
             '|' => {
                 flush_word(&mut tokens, &mut current, &mut quoted, &mut expand);
-                tokens.push(Token::Pipe);
+                if matches!(chars.peek(), Some('|')) {
+                    let _ = chars.next();
+                    tokens.push(Token::OrOr);
+                } else {
+                    tokens.push(Token::Pipe);
+                }
+            }
+            '&' => {
+                flush_word(&mut tokens, &mut current, &mut quoted, &mut expand);
+                if matches!(chars.peek(), Some('&')) {
+                    let _ = chars.next();
+                    tokens.push(Token::AndAnd);
+                } else {
+                    // Single `&` (background) is not supported: treat it as
+                    // a statement separator so scripts degrade sanely.
+                    tokens.push(Token::Separator);
+                }
             }
             '<' => {
                 flush_word(&mut tokens, &mut current, &mut quoted, &mut expand);

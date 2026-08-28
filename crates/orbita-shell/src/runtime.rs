@@ -83,6 +83,18 @@ impl ShellEnvironment {
         &self.history
     }
 
+    pub fn last_status(&self) -> u32 {
+        self.last_status
+    }
+
+    pub fn set_last_status(&mut self, status: u32) {
+        self.last_status = status;
+    }
+
+    pub fn set_var(&mut self, name: impl Into<String>, value: impl Into<String>) {
+        self.vars.insert(name.into(), value.into());
+    }
+
     pub fn vars(&self) -> &BTreeMap<String, String> {
         &self.vars
     }
@@ -147,7 +159,7 @@ impl ShellHost for NoopShellHost {
 }
 
 pub struct ShellRuntime {
-    parser: ShellParser,
+    pub(crate) parser: ShellParser,
 }
 
 impl ShellRuntime {
@@ -189,7 +201,7 @@ impl ShellRuntime {
         Ok(())
     }
 
-    fn execute_script<O: ShellOutput>(
+    pub(crate) fn execute_script<O: ShellOutput>(
         &self,
         env: &mut ShellEnvironment,
         fs: &mut MemoryVolume,
@@ -198,6 +210,12 @@ impl ShellRuntime {
         script: &ShellScript,
     ) {
         for pipeline in &script.pipelines {
+            // `&&` / `||` statement chaining (scripting language).
+            match pipeline.connector {
+                crate::command::Connector::And if env.last_status != 0 => continue,
+                crate::command::Connector::Or if env.last_status == 0 => continue,
+                _ => {}
+            }
             let mut stdin = String::new();
             let last_index = pipeline.commands.len().saturating_sub(1);
             for (index, command) in pipeline.commands.iter().enumerate() {
@@ -303,8 +321,22 @@ impl ShellRuntime {
             "wc" => command_wc(&stdin),
             "head" => command_head(&args, &stdin),
             "tail" => command_tail(&args, &stdin),
+            "test" => command_test(env, fs, &args),
+            "[" => {
+                // `[ expr ]` — drop the closing bracket, keep the test.
+                let mut expr = args.clone();
+                if expr.last().map(String::as_str) == Some("]") {
+                    expr.pop();
+                }
+                command_test(env, fs, &expr)
+            }
             "source" | "." | "sh" | "bash" => command_source(self, env, fs, host, &args),
             other => {
+                // Script execution by path (like Linux `./script.sh`):
+                // any command naming an existing file runs it as a script.
+                if let Some(path) = script_by_path(env, fs, other) {
+                    return command_source(self, env, fs, host, &[path]);
+                }
                 if let Some(result) = command_path_dispatch(env, fs, other, &args, &stdin) {
                     result
                 } else {
@@ -778,8 +810,7 @@ fn command_source(
     fs: &mut MemoryVolume,
     host: &mut dyn ShellHost,
     args: &[String],
-) -> CommandResult {
-    let Some(path) = args.first() else {
+) -> CommandResult {    let Some(path) = args.first() else {
         return CommandResult::err("source: missing path", Some(String::from("source failed")));
     };
     let resolved = resolve_path(env.cwd(), path);
@@ -787,21 +818,16 @@ fn command_source(
         Ok(bytes) => {
             let script = String::from_utf8_lossy(&bytes).to_string();
             let mut buffer = CapturedOutput::default();
-            match runtime.execute_script_text(env, fs, &mut buffer, host, &script) {
-                Ok(()) => CommandResult {
-                    stdout: buffer.text,
-                    status: if buffer.failed { 1 } else { 0 },
-                    status_text: Some(if buffer.failed {
-                        String::from("script failed")
-                    } else {
-                        String::from("ok")
-                    }),
-                    clear_screen: buffer.clear,
-                },
-                Err(err) => CommandResult::err(
-                    &format!("source parse error: {:?}", err),
-                    Some(String::from("source failed")),
-                ),
+            let status = crate::interp::run_script(runtime, env, fs, &mut buffer, host, &script, 0);
+            CommandResult {
+                stdout: buffer.text,
+                status,
+                status_text: Some(if buffer.failed || status != 0 {
+                    String::from("script failed")
+                } else {
+                    String::from("ok")
+                }),
+                clear_screen: buffer.clear,
             }
         }
         Err(err) => CommandResult::err(
@@ -809,6 +835,82 @@ fn command_source(
             Some(String::from("source failed")),
         ),
     }
+}
+
+/// `test` / `[ … ]` — the scripting condition primitive.
+/// Supported: `-z s`, `-n s`, `a = b`, `a != b`, `-f p`, `-d p`,
+/// `-eq -ne -lt -le -gt -ge` (integer), `! expr` (negation).
+fn command_test(
+    env: &ShellEnvironment,
+    fs: &mut MemoryVolume,
+    args: &[String],
+) -> CommandResult {
+    let ok = eval_test(env, fs, args);
+    CommandResult {
+        stdout: String::new(),
+        status: if ok { 0 } else { 1 },
+        status_text: Some(String::from(if ok { "true" } else { "false" })),
+        clear_screen: false,
+    }
+}
+
+/// Evaluates a `test` expression (host-testable core).
+pub(crate) fn eval_test(env: &ShellEnvironment, fs: &mut MemoryVolume, args: &[String]) -> bool {
+    if let Some((first, rest)) = args.split_first() {
+        if first == "!" {
+            return !eval_test(env, fs, rest);
+        }
+    }
+    match args.len() {
+        0 => false,
+        1 => args[0] != "",
+        2 => match args[0].as_str() {
+            "-z" => args[1].is_empty(),
+            "-n" => !args[1].is_empty(),
+            "-f" => {
+                let path = resolve_path(env.cwd(), &args[1]);
+                matches!(fs.read_file_path(&path), Ok(_))
+            }
+            "-d" => {
+                let path = resolve_path(env.cwd(), &args[1]);
+                fs.list_path(&path).is_ok()
+            }
+            _ => false,
+        },
+        3 => {
+            let (lhs, op, rhs) = (&args[0], args[1].as_str(), &args[2]);
+            match op {
+                "=" | "==" => lhs == rhs,
+                "!=" => lhs != rhs,
+                "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" => {
+                    let (Some(a), Some(b)) = (lhs.parse::<i64>().ok(), rhs.parse::<i64>().ok())
+                    else {
+                        return false;
+                    };
+                    match op {
+                        "-eq" => a == b,
+                        "-ne" => a != b,
+                        "-lt" => a < b,
+                        "-le" => a <= b,
+                        "-gt" => a > b,
+                        _ => a >= b,
+                    }
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// If `name` names an existing file (relative, `./x.sh` or absolute),
+/// return the resolved path — scripts run like Linux `./script.sh`.
+pub(crate) fn script_by_path(env: &ShellEnvironment, fs: &mut MemoryVolume, name: &str) -> Option<String> {
+    if !name.starts_with("./") && !name.starts_with('/') && !name.starts_with("../") {
+        return None;
+    }
+    let path = resolve_path(env.cwd(), name);
+    fs.read_file_path(&path).is_ok().then_some(path)
 }
 
 fn command_which(env: &ShellEnvironment, fs: &mut MemoryVolume, args: &[String]) -> CommandResult {
@@ -1228,7 +1330,7 @@ fn emit_text<O: ShellOutput>(output: &mut O, text: &str) {
     }
 }
 
-fn expand_argument(env: &ShellEnvironment, arg: &CommandArg) -> String {
+pub(crate) fn expand_argument(env: &ShellEnvironment, arg: &CommandArg) -> String {
     expand_argument_from(env, env.vars(), arg)
 }
 

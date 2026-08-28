@@ -696,3 +696,10 @@ flowchart LR
   (свой IP → очередь → receive, без NIC), API listen/connect/send/accept/
   close; FSM-фиксы ISN; бут-тест handshake→echo→close (CI-маркеры);
   net 50 тестов, workspace 114/0.
+- Скриптовый язык (контракт платформы): интерпретатор в orbita-shell
+  (`interp.rs`, 9 host-тестов) — if/elif/else, while, for, break/
+  continue, exit, `&&`/`||` (коннекторы в парсере), `test`/`[`,
+  запуск `sh x.sh` и `./x.sh` (скрипт по любому пути), лимиты
+  (10k итераций, глубина 8); демо `/etc/demo.sh` в каждом буте
+  (CI-маркеры); полный справочник `docs/scripting.md` + README-контракт
+  + AGENTS-правило скриптуемости модулей.

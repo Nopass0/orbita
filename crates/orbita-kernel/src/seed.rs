@@ -106,6 +106,12 @@ pub(crate) fn seed_shell_volume(fs: &mut MemoryVolume) -> Result<(), orbita_fs::
         "/etc/profile.sh",
         b"export GREETING=Orbita\nmkdir /tmp\nwrite /tmp/hello.txt \"$GREETING shell runtime\"\ncat /tmp/hello.txt\npkg update\npkg install python3 nodejs rust build-essential\npython -c \"print('hello from orbita')\"\nnode -e \"console.log('hello from orbita')\"\ncat /system/manifest/apps.toml\ncat /system/manifest/services.toml\n",
     )?;
+    // Scripting-language demo: runs at every boot via `sh /etc/demo.sh`
+    // (see docs/scripting.md) — proves if/for/test/&& in the live OS.
+    fs.create_file_path(
+        "/etc/demo.sh",
+        b"#!/bin/sh\n# Orbita scripting language demo (docs/scripting.md)\nfor d in /etc /home /usr\ndo\n  if test -d $d\n  then\n    echo \"script dir: $d\"\n  fi\ndone\nif test -f /etc/orbita.conf\nthen\n  echo \"script: if ok (config found)\"\nelse\n  echo \"script: config missing\"\nfi\ntest -d /etc && echo \"script: and-ok\" || echo \"script: and-fail\"\n",
+    )?;
     fs.create_file_path(
         "/var/lib/orbita/pkg/available.txt",
         b"# Orbita package index\npython3|3.12.0-compat|runtime|Python 3 compatibility runtime with python/pip entrypoints|python,python3,pip,pip3|\nnodejs|22.0.0-compat|runtime|Node.js compatibility runtime with npm/npx entrypoints|node,nodejs,npm,npx|\nrust|1.80.0-compat|toolchain|Rust compatibility toolchain with cargo/rustc/rustfmt|rust,cargo,rustc,rustfmt|\ngcc|14.2.0-compat|compiler|GNU C compatibility compiler with cc entrypoint|gcc,cc|\ngxx|14.2.0-compat|compiler|GNU C++ compatibility compiler with g++/c++ entrypoints|g++,c++|gcc\nclang|18.1.0-compat|compiler|LLVM/Clang compatibility compiler with clang/clang++ entrypoints|clang,clang++|\nmake|4.4-compat|build|GNU make compatibility runner|make|\nbuild-essential|1.0-compat|meta|Meta-package for Linux-like C/C++ build environments|build-essential|gcc,gxx,make\n",
