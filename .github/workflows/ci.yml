@@ -139,6 +139,8 @@ jobs:
           check "ring3: user address space ready"
           check "ring3: roundtrip ok=true"
           check "elf: out-of-region segment rejected"
+          check "tcp loopback connect ok"
+          check "tcp loopback echo ok"
           check "autorun3 hello exit=0 ring3"
           check "autorun3 sysinfo exit=0 ring3"
           check "fault-kill ok=true"

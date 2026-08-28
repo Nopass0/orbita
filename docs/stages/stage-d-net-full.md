@@ -53,3 +53,28 @@ retransmit (таймер на poll-тиках), `TcpListener::accept`; loopback-
 ---
 *(шаблон порции: дата → Сделано/Тесты/Дальше; статусы: ⬜ planned,
 🔄 in progress, ✅ done, ⚠️ blocked)*
+
+### 2026-08-29 — порция 2: TCP в живой ОС (loopback-коннект) ✅
+
+**Сделано:**
+- `orbita-net/src/tcp_socket.rs`: `TcpEndpoint` (адрес-тупл + TCB + rx-буфер
+  + parent-listener) + `find_endpoint` (точное совпадение → listener).
+- `stack.rs`: TCP-слой — `receive_tcp` (демультиплексирование; SYN на
+  listener → спавн child'а со свежим ISN), `tcp_emit` (TCP+IP+Ethernet;
+  **software-loopback**: кадр на свой IP → очередь `loopback_rx`, иначе
+  pending_tx+ARP), `tcp_pump` (дренаж очереди, до 64 кадров),
+  публичный API: `tcp_listen/tcp_connect/tcp_state/tcp_send/tcp_take_rx/
+  tcp_accept/tcp_close`.
+- **FSM-фиксы, найденные интеграцией**: Listen-ветка не advancing snd_nxt
+  на SYN+ACK (child-соединения жили с кривым ISN — данные шли
+  out-of-order); SYN+ACK в SYN-SENT теперь валидирует ack == isn+1.
+- Ядро: TCP loopback self-test при буте (connect→established, echo
+  19 байт, graceful close) — маркеры `tcp loopback connect/echo ok`
+  (CI).
+
+**Тесты:** orbita-net 50/0 (+4 loopback: handshake с проверкой
+rcv_nxt==snd_nxt обеих сторон, echo roundtrip, close, no-listener);
+workspace **114/0**; QEMU ×3: tcp=1/1/1, kill-ok, ring3, boots=1.
+
+**Дальше (порция 3):** SDK-сокеты (`sys::net::TcpStream` через ABI v2),
+retransmit/RTO, RST на закрытые порты, сегментация >512 байт, DHCP.

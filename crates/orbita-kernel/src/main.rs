@@ -295,6 +295,51 @@ fn kernel_main(boot_info: BootInfo) -> ! {
     );
     let local_apic = probe_local_apic();
     let idt = install_bootstrap_idt();
+    // Stage-D portion 2: TCP loopback self-test — full software path
+    // (handshake → echo → close) through the real frame/checksum code,
+    // no NIC involved.
+    {
+        let listener = net_stack.tcp_listen(8080);
+        match net_stack.tcp_connect(Ipv4Address::LOCALHOST, 8080) {
+            Some(client) => {
+                net_stack.tcp_pump();
+                match net_stack.tcp_accept(listener) {
+                    Some(server) => {
+                        println!("Orbita OS: tcp loopback connect ok (established)");
+                        let echoed = if net_stack.tcp_send(client, b"orbita-tcp-loopback") {
+                            net_stack.tcp_pump();
+                            let data = net_stack.tcp_take_rx(server);
+                            if data.as_slice() == b"orbita-tcp-loopback"
+                                && net_stack.tcp_send(server, &data)
+                            {
+                                net_stack.tcp_pump();
+                                net_stack.tcp_take_rx(client)
+                            } else {
+                                Vec::new()
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        if echoed.as_slice() == b"orbita-tcp-loopback" {
+                            println!("Orbita OS: tcp loopback echo ok ({} bytes)", echoed.len());
+                        } else {
+                            println!("Orbita OS: tcp loopback echo FAILED");
+                        }
+                        net_stack.tcp_close(client);
+                        net_stack.tcp_close(server);
+                        net_stack.tcp_pump();
+                        println!(
+                            "Orbita OS: tcp loopback close client={:?} server={:?}",
+                            net_stack.tcp_state(client),
+                            net_stack.tcp_state(server)
+                        );
+                    }
+                    None => println!("Orbita OS: tcp loopback connect FAILED (no accept)"),
+                }
+            }
+            None => println!("Orbita OS: tcp loopback connect FAILED (no route)"),
+        }
+    }
     // Stage-A portion 6: kernel/user GDT + TSS (rsp0/IST). Selectors are
     // layout-compatible with the bootstrap IDT (0x08), so installing the
     // GDT right after the IDT keeps every existing entry valid.

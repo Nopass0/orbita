@@ -10,7 +10,9 @@ use crate::ethernet::{EthernetFrame, EtherType, MacAddress};
 use crate::icmp::{IcmpKind, IcmpMessage};
 use crate::ipv4::{protocol, Ipv4Address, Ipv4Header};
 use crate::nic::{NicDriverKind, NicInfo};
-use crate::tcp::TcpSegment;
+use crate::tcp::{TcpFlags, TcpSegment};
+use crate::tcp_socket::{find_endpoint, TcpEndpoint};
+use crate::tcp_state::{SendPlan, TcpAction, TcpState};
 use crate::udp::UdpDatagram;
 use orbita_std::{String, Vec, format};
 
@@ -99,7 +101,16 @@ pub struct NetworkStack {
     /// Echo replies awaiting transmission (destination MAC is resolved via
     /// the ARP cache by the driver).
     pub pending_tx: Vec<Vec<u8>>,
+    /// TCP endpoints (connections + listeners), stage D.2.
+    pub tcp: Vec<TcpEndpoint>,
+    /// Accepted child connections per listener, ready for `tcp_accept`.
+    tcp_accepted: Vec<(usize, usize)>,
+    /// Frames addressed to our own IP: software-looped back into
+    /// `receive` by `tcp_pump` (no NIC round-trip).
+    loopback_rx: Vec<Vec<u8>>,
     next_ip_id: u16,
+    next_ephemeral: u16,
+    tcp_isn: u32,
 }
 
 impl NetworkStack {
@@ -108,7 +119,12 @@ impl NetworkStack {
             interfaces: Vec::new(),
             arp: ArpCache::new(),
             pending_tx: Vec::new(),
+            tcp: Vec::new(),
+            tcp_accepted: Vec::new(),
+            loopback_rx: Vec::new(),
             next_ip_id: 1,
+            next_ephemeral: 49152,
+            tcp_isn: 0x1D00_0000,
         };
         stack.interfaces.push(NetworkInterface::loopback());
         stack
@@ -270,6 +286,7 @@ impl NetworkStack {
                         flags_text: segment.flags.text(),
                         destination_port: segment.destination_port,
                     });
+                    self.receive_tcp(&header, &segment);
                 } else {
                     events.push(StackEvent::FrameDropped { reason: "tcp-checksum" });
                 }
@@ -412,6 +429,263 @@ impl NetworkStack {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // TCP socket layer (stage D.2): demux → state machine → frame.
+    // -----------------------------------------------------------------------
+
+    /// Demuxes one inbound segment into an endpoint and executes the
+    /// state machine's action. A SYN to a listener spawns the accepted
+    /// child connection (with a fresh ISN — both sides' sequence spaces
+    /// must be independent).
+    fn receive_tcp(&mut self, header: &Ipv4Header, segment: &TcpSegment<'_>) {
+        let Some(mut index) = find_endpoint(
+            &self.tcp,
+            header.destination,
+            segment.destination_port,
+            header.source,
+            segment.source_port,
+        ) else {
+            // No socket for the tuple: silently drop (RST is a later
+            // hardening step).
+            return;
+        };
+        if self.tcp[index].cb.state == TcpState::Listen && segment.flags.has(TcpFlags::SYN) {
+            // Seed the child's ISN before feeding the SYN so the Listen
+            // branch answers from a proper sequence space.
+            let isn = self.tcp_isn;
+            self.tcp_isn = self.tcp_isn.wrapping_add(64_000);
+            let mut child = TcpEndpoint {
+                local_ip: header.destination,
+                local_port: segment.destination_port,
+                remote_ip: header.source,
+                remote_port: segment.source_port,
+                cb: crate::tcp_state::TcpControlBlock::listen(),
+                rx: Vec::new(),
+                parent: Some(index),
+            };
+            child.cb.snd_isn = isn;
+            index = self.tcp.len();
+            self.tcp.push(child);
+        }
+
+        let endpoint = &mut self.tcp[index];
+        let in_order = segment.sequence == endpoint.cb.rcv_nxt;
+        let action = endpoint.cb.on_segment(
+            segment.sequence,
+            segment.acknowledgment,
+            segment.flags,
+            segment.payload.len(),
+        );
+        let delivers_data = in_order
+            && !segment.payload.is_empty()
+            && matches!(
+                endpoint.cb.state,
+                TcpState::Established | TcpState::CloseWait | TcpState::FinWait2
+            );
+        if delivers_data {
+            endpoint.rx.extend_from_slice(segment.payload);
+        }
+        let local_ip = endpoint.local_ip;
+        let local_port = endpoint.local_port;
+        let remote_ip = endpoint.remote_ip;
+        let remote_port = endpoint.remote_port;
+
+        match action {
+            TcpAction::Send(plan) => {
+                self.tcp_emit(local_ip, local_port, remote_ip, remote_port, plan, &[]);
+            }
+            TcpAction::Opened => {
+                if let Some(parent) = self.tcp[index].parent {
+                    self.tcp_accepted.push((parent, index));
+                }
+            }
+            TcpAction::Closed | TcpAction::Drop => {}
+        }
+    }
+
+    /// Builds one TCP segment (+IP +Ethernet) and dispatches it: frames to
+    /// our own address loop back through `loopback_rx`, everything else
+    /// goes to `pending_tx` (MAC via the ARP cache).
+    fn tcp_emit(
+        &mut self,
+        src_ip: Ipv4Address,
+        src_port: u16,
+        dst_ip: Ipv4Address,
+        dst_port: u16,
+        plan: SendPlan,
+        payload: &[u8],
+    ) -> bool {
+        const MTU: usize = 14 + 20 + crate::tcp::HEADER_LEN + 512;
+        let mut frame_buf = [0u8; MTU];
+        let tcp_len = match TcpSegment::build(
+            src_ip,
+            src_port,
+            dst_ip,
+            dst_port,
+            plan.sequence,
+            plan.acknowledgment,
+            plan.flags,
+            8192,
+            payload,
+            &mut frame_buf[14 + 20..],
+        ) {
+            Some(len) => len,
+            None => return false,
+        };
+        let ip_len = match Ipv4Header::build(
+            src_ip,
+            dst_ip,
+            protocol::TCP,
+            crate::tcp::HEADER_LEN + payload.len(),
+            self.next_ip_id,
+            64,
+            &mut frame_buf[14..],
+        ) {
+            Some(len) => len,
+            None => return false,
+        };
+        self.next_ip_id = self.next_ip_id.wrapping_add(1);
+
+        let loopback = self.interfaces.iter().any(|i| i.address == dst_ip);
+        let (dst_mac, src_mac) = if loopback {
+            let mac = self
+                .interface_for(dst_ip)
+                .map(|i| i.mac)
+                .unwrap_or(MacAddress::ZERO);
+            (mac, mac)
+        } else {
+            let src = self
+                .interface_for(src_ip)
+                .map(|i| i.mac)
+                .unwrap_or(MacAddress::ZERO);
+            let dst = self.arp.lookup(dst_ip.0).unwrap_or(MacAddress::BROADCAST);
+            (dst, src)
+        };
+        let end = 14 + ip_len + tcp_len;
+        let packet = frame_buf[14..end].to_vec();
+        let Some(total) =
+            EthernetFrame::build(dst_mac, src_mac, EtherType::Ipv4, &packet, &mut frame_buf)
+        else {
+            return false;
+        };
+        let frame = frame_buf[..total].to_vec();
+        if loopback {
+            self.loopback_rx.push(frame);
+        } else {
+            self.pending_tx.push(frame);
+        }
+        true
+    }
+
+    /// Drains the software-loopback queue: every queued frame re-enters
+    /// [`NetworkStack::receive`], which may queue more (bounded by the
+    /// protocol's frame count, not by data size).
+    pub fn tcp_pump(&mut self) {
+        let mut steps = 0usize;
+        while !self.loopback_rx.is_empty() && steps < 64 {
+            let frame = self.loopback_rx.remove(0);
+            let _ = self.receive(&frame);
+            steps += 1;
+        }
+    }
+
+    /// Opens a listening slot on `port` of the loopback interface and
+    /// returns its endpoint id.
+    pub fn tcp_listen(&mut self, port: u16) -> usize {
+        let ip = self
+            .interfaces
+            .iter()
+            .find(|i| i.kind == InterfaceKind::Loopback)
+            .map(|i| i.address)
+            .unwrap_or(Ipv4Address::LOCALHOST);
+        self.tcp.push(TcpEndpoint::listener(ip, port));
+        self.tcp.len() - 1
+    }
+
+    /// Active open to `(remote, remote_port)` from the interface routing
+    /// there; returns the endpoint id after queueing the SYN.
+    pub fn tcp_connect(&mut self, remote: Ipv4Address, remote_port: u16) -> Option<usize> {
+        let (interface, _) = self.route(remote)?;
+        let local_ip = interface.address;
+        let local_port = self.next_ephemeral;
+        self.next_ephemeral = self.next_ephemeral.wrapping_add(1).max(49152);
+        let isn = self.tcp_isn;
+        self.tcp_isn = self.tcp_isn.wrapping_add(64_000);
+        let (cb, action) = crate::tcp_state::TcpControlBlock::active_open(isn);
+        self.tcp.push(TcpEndpoint {
+            local_ip,
+            local_port,
+            remote_ip: remote,
+            remote_port,
+            cb,
+            rx: Vec::new(),
+            parent: None,
+        });
+        let id = self.tcp.len() - 1;
+        if let TcpAction::Send(plan) = action {
+            self.tcp_emit(local_ip, local_port, remote, remote_port, plan, &[]);
+        }
+        Some(id)
+    }
+
+    /// Current state of an endpoint.
+    pub fn tcp_state(&self, id: usize) -> TcpState {
+        self.tcp.get(id).map(|e| e.cb.state).unwrap_or(TcpState::Closed)
+    }
+
+    /// Sends `data` on an established connection (v1: one segment,
+    /// ≤512 bytes per call).
+    pub fn tcp_send(&mut self, id: usize, data: &[u8]) -> bool {
+        let Some(endpoint) = self.tcp.get(id) else { return false };
+        if !endpoint.cb.state.can_send_data() || data.is_empty() || data.len() > 512 {
+            return false;
+        }
+        let (src_ip, src_port) = (endpoint.local_ip, endpoint.local_port);
+        let (dst_ip, dst_port) = (endpoint.remote_ip, endpoint.remote_port);
+        let (sequence, acknowledgment) = endpoint.cb.send_header();
+        let plan = SendPlan {
+            flags: TcpFlags::default().set(TcpFlags::ACK).set(TcpFlags::PSH),
+            sequence,
+            acknowledgment,
+        };
+        let ok = self.tcp_emit(src_ip, src_port, dst_ip, dst_port, plan, data);
+        if ok {
+            if let Some(endpoint) = self.tcp.get_mut(id) {
+                endpoint.cb.data_sent(data.len());
+            }
+        }
+        ok
+    }
+
+    /// Drains the endpoint's receive buffer.
+    pub fn tcp_take_rx(&mut self, id: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        if let Some(endpoint) = self.tcp.get_mut(id) {
+            core::mem::swap(&mut out, &mut endpoint.rx);
+        }
+        out
+    }
+
+    /// Takes one accepted connection from a listener.
+    pub fn tcp_accept(&mut self, listener: usize) -> Option<usize> {
+        let position = self.tcp_accepted.iter().position(|(l, _)| *l == listener)?;
+        let (_, child) = self.tcp_accepted.remove(position);
+        Some(child)
+    }
+
+    /// Active close (FIN).
+    pub fn tcp_close(&mut self, id: usize) -> bool {
+        let Some(endpoint) = self.tcp.get_mut(id) else { return false };
+        let action = endpoint.cb.close();
+        let (src_ip, src_port) = (endpoint.local_ip, endpoint.local_port);
+        let (dst_ip, dst_port) = (endpoint.remote_ip, endpoint.remote_port);
+        if let TcpAction::Send(plan) = action {
+            self.tcp_emit(src_ip, src_port, dst_ip, dst_port, plan, &[])
+        } else {
+            false
+        }
+    }
+
     /// Boot summary for the kernel log.
     pub fn summary(&self) -> String {
         let mut out = format!("net: interfaces={}", self.interfaces.len());
@@ -505,5 +779,71 @@ mod tests {
         assert!(s.contains("interfaces=2"));
         assert!(s.contains("lo 127.0.0.1/8"));
         assert!(s.contains("10.0.2.15/24 gw=10.0.2.2"));
+    }
+
+    // --- TCP software loopback (stage D.2) ---------------------------------
+
+    #[test]
+    fn tcp_loopback_handshake() {
+        let mut stack = stack_with_nic();
+        let listener = stack.tcp_listen(8080);
+        let client = stack.tcp_connect(Ipv4Address::LOCALHOST, 8080).unwrap();
+        assert_eq!(stack.tcp_state(client), TcpState::SynSent);
+        stack.tcp_pump();
+        let server = stack.tcp_accept(listener).expect("accepted");
+        assert_eq!(stack.tcp_state(client), TcpState::Established);
+        assert_eq!(stack.tcp_state(server), TcpState::Established);
+        // Both sequence spaces aligned: client's next byte matches the
+        // server's expectation.
+        assert_eq!(stack.tcp[server].cb.rcv_nxt, stack.tcp[client].cb.snd_nxt);
+    }
+
+    #[test]
+    fn tcp_loopback_echo_roundtrip() {
+        let mut stack = stack_with_nic();
+        let listener = stack.tcp_listen(8081);
+        let client = stack.tcp_connect(Ipv4Address::LOCALHOST, 8081).unwrap();
+        stack.tcp_pump();
+        let server = stack.tcp_accept(listener).unwrap();
+
+        assert!(stack.tcp_send(client, b"orbita-tcp-loopback"));
+        stack.tcp_pump();
+        let received = stack.tcp_take_rx(server);
+        assert_eq!(received, b"orbita-tcp-loopback");
+
+        // Echo back.
+        assert!(stack.tcp_send(server, &received));
+        stack.tcp_pump();
+        let echoed = stack.tcp_take_rx(client);
+        assert_eq!(echoed, b"orbita-tcp-loopback");
+    }
+
+    #[test]
+    fn tcp_loopback_close_both_sides() {
+        let mut stack = stack_with_nic();
+        let listener = stack.tcp_listen(8082);
+        let client = stack.tcp_connect(Ipv4Address::LOCALHOST, 8082).unwrap();
+        stack.tcp_pump();
+        let server = stack.tcp_accept(listener).unwrap();
+
+        stack.tcp_close(client);
+        stack.tcp_pump();
+        assert_eq!(stack.tcp_state(server), TcpState::CloseWait);
+        assert_eq!(stack.tcp_state(client), TcpState::FinWait2);
+
+        stack.tcp_close(server);
+        stack.tcp_pump();
+        assert_eq!(stack.tcp_state(client), TcpState::TimeWait);
+        // The client's final ACK already completed the server's LAST-ACK.
+        assert_eq!(stack.tcp_state(server), TcpState::Closed);
+    }
+
+    #[test]
+    fn tcp_no_listener_is_dropped_silently() {
+        let mut stack = stack_with_nic();
+        let client = stack.tcp_connect(Ipv4Address::LOCALHOST, 9999).unwrap();
+        stack.tcp_pump();
+        assert_eq!(stack.tcp_state(client), TcpState::SynSent);
+        assert!(stack.loopback_rx.is_empty());
     }
 }

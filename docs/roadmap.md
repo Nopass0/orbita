@@ -691,3 +691,8 @@ flowchart LR
   open, simultaneous open/close, out-of-order re-ACK, half-close,
   TIME_WAIT timeout, RST), close()/timeout()/data_sent API; 21 host-тест
   «сегмент×состояние»; net 25→46, workspace 110/0.
+- Этап D, порция 2: **TCP-коннекты в живой ОС** — сокет-слой в
+  NetworkStack (демультиплексирование → FSM → кадр), software-loopback
+  (свой IP → очередь → receive, без NIC), API listen/connect/send/accept/
+  close; FSM-фиксы ISN; бут-тест handshake→echo→close (CI-маркеры);
+  net 50 тестов, workspace 114/0.

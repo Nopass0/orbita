@@ -152,7 +152,10 @@ impl TcpControlBlock {
                 if flags.has(TcpFlags::SYN) {
                     self.rcv_isn = sequence;
                     self.rcv_nxt = sequence.wrapping_add(1);
-                    self.snd_isn = self.snd_nxt;
+                    // `snd_isn` is pre-seeded by the socket layer; the
+                    // SYN+ACK consumes one sequence number so data starts
+                    // at snd_isn + 1 (mirrors `active_open`).
+                    self.snd_nxt = self.snd_isn.wrapping_add(1);
                     self.state = TcpState::SynReceived;
                     return TcpAction::Send(SendPlan {
                         flags: TcpFlags::default().set(TcpFlags::SYN).set(TcpFlags::ACK),
@@ -167,8 +170,12 @@ impl TcpControlBlock {
                     self.rcv_isn = sequence;
                     self.rcv_nxt = sequence.wrapping_add(1);
                     if flags.has(TcpFlags::ACK) {
-                        // SYN+ACK completing our handshake: consume the ACK
-                        // of our ISN and move straight to ESTABLISHED.
+                        // SYN+ACK completing our handshake: the ACK must
+                        // cover our ISN (guard against cross-talk clobbering
+                        // snd_nxt).
+                        if acknowledgment != self.snd_isn.wrapping_add(1) {
+                            return TcpAction::Drop;
+                        }
                         self.snd_nxt = acknowledgment;
                         self.state = TcpState::Established;
                         return TcpAction::Send(SendPlan {
