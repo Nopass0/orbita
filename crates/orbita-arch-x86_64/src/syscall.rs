@@ -64,6 +64,24 @@ orbita_ring3_saved_rdi:
     .align 8
 orbita_ring3_saved_rsi:
     .zero 8
+    .align 8
+orbita_ring3_saved_rbx:
+    .zero 8
+    .align 8
+orbita_ring3_saved_rbp:
+    .zero 8
+    .align 8
+orbita_ring3_saved_r12:
+    .zero 8
+    .align 8
+orbita_ring3_saved_r13:
+    .zero 8
+    .align 8
+orbita_ring3_saved_r14:
+    .zero 8
+    .align 8
+orbita_ring3_saved_r15:
+    .zero 8
     .align 16
 orbita_xmm_save:
     .zero 160
@@ -72,12 +90,20 @@ orbita_xmm_save:
     # Kill path for user-mode CPU faults (roadmap A.7): the fault handler
     # detects CS.RPL=3 with a ring-3 execution active and tail-calls here
     # instead of halting. Same context restore as the EXIT unwind, with
-    # the fault sentinel as the returned exit code.
+    # the fault sentinel as the returned exit code. The full Win64
+    # callee-saved set is restored explicitly: the unwind skips the fault
+    # handler's own epilogue, so its working registers must not leak.
     .global orbita_x86_64_ring3_kill_restore
 orbita_x86_64_ring3_kill_restore:
     mov qword ptr [rip + orbita_ring3_finished], 0
     mov rdi, [rip + orbita_ring3_saved_rdi]
     mov rsi, [rip + orbita_ring3_saved_rsi]
+    mov rbx, [rip + orbita_ring3_saved_rbx]
+    mov rbp, [rip + orbita_ring3_saved_rbp]
+    mov r12, [rip + orbita_ring3_saved_r12]
+    mov r13, [rip + orbita_ring3_saved_r13]
+    mov r14, [rip + orbita_ring3_saved_r14]
+    mov r15, [rip + orbita_ring3_saved_r15]
     movaps xmm6, [rip + orbita_xmm_save + 0]
     movaps xmm7, [rip + orbita_xmm_save + 16]
     movaps xmm8, [rip + orbita_xmm_save + 32]
@@ -126,13 +152,20 @@ orbita_syscall_ring0_return:
     jmp rcx
 orbita_syscall_done_path:
     # Ring-3 execution finished (EXIT syscall / self-test DONE): resume
-    # the kernel context that entered ring 3. RBX/RBP/R12-15 survive
-    # (callee-saved in BOTH Win64 and SysV); RDI/RSI and XMM6-15 are
-    # Win64-callee-saved but SysV-volatile — the application clobbers
-    # them — so restore before returning to the kernel (rax = exit code).
+    # the kernel context that entered ring 3. RDI/RSI and XMM6-15 are
+    # Win64-callee-saved but SysV-volatile (the application clobbers
+    # them); the GPR callee-saved set is restored explicitly too —
+    # symmetric with the kill path and robust against any handler
+    # codegen (rax = exit code).
     mov qword ptr [rip + orbita_ring3_finished], 0
     mov rdi, [rip + orbita_ring3_saved_rdi]
     mov rsi, [rip + orbita_ring3_saved_rsi]
+    mov rbx, [rip + orbita_ring3_saved_rbx]
+    mov rbp, [rip + orbita_ring3_saved_rbp]
+    mov r12, [rip + orbita_ring3_saved_r12]
+    mov r13, [rip + orbita_ring3_saved_r13]
+    mov r14, [rip + orbita_ring3_saved_r14]
+    mov r15, [rip + orbita_ring3_saved_r15]
     movaps xmm6, [rip + orbita_xmm_save + 0]
     movaps xmm7, [rip + orbita_xmm_save + 16]
     movaps xmm8, [rip + orbita_xmm_save + 32]
@@ -153,6 +186,12 @@ orbita_x86_64_enter_ring3:
     mov [rip + orbita_ring3_saved_krsp], rsp
     mov [rip + orbita_ring3_saved_rdi], rdi
     mov [rip + orbita_ring3_saved_rsi], rsi
+    mov [rip + orbita_ring3_saved_rbx], rbx
+    mov [rip + orbita_ring3_saved_rbp], rbp
+    mov [rip + orbita_ring3_saved_r12], r12
+    mov [rip + orbita_ring3_saved_r13], r13
+    mov [rip + orbita_ring3_saved_r14], r14
+    mov [rip + orbita_ring3_saved_r15], r15
     movaps [rip + orbita_xmm_save + 0], xmm6
     movaps [rip + orbita_xmm_save + 16], xmm7
     movaps [rip + orbita_xmm_save + 32], xmm8
