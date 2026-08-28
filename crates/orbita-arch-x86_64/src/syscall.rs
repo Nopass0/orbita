@@ -69,6 +69,29 @@ orbita_xmm_save:
     .zero 160
     .section .text
 
+    # Kill path for user-mode CPU faults (roadmap A.7): the fault handler
+    # detects CS.RPL=3 with a ring-3 execution active and tail-calls here
+    # instead of halting. Same context restore as the EXIT unwind, with
+    # the fault sentinel as the returned exit code.
+    .global orbita_x86_64_ring3_kill_restore
+orbita_x86_64_ring3_kill_restore:
+    mov qword ptr [rip + orbita_ring3_finished], 0
+    mov rdi, [rip + orbita_ring3_saved_rdi]
+    mov rsi, [rip + orbita_ring3_saved_rsi]
+    movaps xmm6, [rip + orbita_xmm_save + 0]
+    movaps xmm7, [rip + orbita_xmm_save + 16]
+    movaps xmm8, [rip + orbita_xmm_save + 32]
+    movaps xmm9, [rip + orbita_xmm_save + 48]
+    movaps xmm10, [rip + orbita_xmm_save + 64]
+    movaps xmm11, [rip + orbita_xmm_save + 80]
+    movaps xmm12, [rip + orbita_xmm_save + 96]
+    movaps xmm13, [rip + orbita_xmm_save + 112]
+    movaps xmm14, [rip + orbita_xmm_save + 128]
+    movaps xmm15, [rip + orbita_xmm_save + 144]
+    mov rsp, [rip + orbita_ring3_saved_krsp]
+    mov rax, 0xCAFEF139
+    ret
+
     .global orbita_x86_64_syscall_entry
 orbita_x86_64_syscall_entry:
     # rax = nr, rdi/rsi/rdx = args (SysV), rcx = user rip, r11 = user rflags.
@@ -152,12 +175,38 @@ orbita_x86_64_enter_ring3:
 unsafe extern "C" {
     fn orbita_x86_64_syscall_entry() -> !;
     fn orbita_x86_64_enter_ring3(user_rip: u64, user_rsp: u64) -> u64;
+    fn orbita_x86_64_ring3_kill_restore() -> !;
     /// Finish flag shared with the syscall asm epilogue — MUST be the
     /// same storage the asm reads (a Rust-side twin stays invisible to
     /// the asm and silently breaks the unwind; this bit us in portion 6).
     static mut orbita_ring3_finished: u64;
     /// Ring-0 syscall-return selector shared with the asm epilogue.
     static mut orbita_syscall_ring0: u8;
+}
+
+/// Sentinel returned by [`enter_ring3`] when the process was killed by a
+/// user-mode CPU fault (see `kill_ring3_from_fault`). Low 32 bits map to
+/// the conventional "killed by signal 11" exit code 139.
+pub const FAULT_KILL_SENTINEL: u64 = 0xCAFE_F139;
+
+/// Whether a ring-3 execution is currently active (Rust-side only — set
+/// and cleared by the [`enter_ring3`] wrapper around the asm call).
+static RING3_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether ring-3 code is executing right now (fault-handler input).
+pub fn ring3_active() -> bool {
+    RING3_ACTIVE.load(Ordering::SeqCst)
+}
+
+/// Kills the faulting ring-3 process: unwinds to the kernel context that
+/// entered ring 3 with [`FAULT_KILL_SENTINEL`] as the exit code. Never
+/// returns — called by the CPU-fault handler on user-mode faults.
+///
+/// # Safety
+/// A ring-3 execution must be active (saved context exists).
+pub unsafe fn kill_ring3_from_fault() -> ! {
+    // SAFETY: caller guarantees an active ring-3 context to unwind to.
+    unsafe { orbita_x86_64_ring3_kill_restore() }
 }
 
 /// Number of syscalls dispatched (telemetry).
@@ -238,15 +287,18 @@ pub fn install_syscall_gate() {
 }
 
 /// Enters ring 3 at `user_rip` with `user_rsp`. Returns only when a
-/// kernel-side [`finish_ring3`] ends ring-3 execution; the return value
-/// is the exit code passed there.
+/// kernel-side [`finish_ring3`] ends ring-3 execution (exit code) or the
+/// process is killed by a user-mode CPU fault ([`FAULT_KILL_SENTINEL`]).
 ///
 /// # Safety
 /// Caller guarantees USER-mapped, executable code at `user_rip` and a
 /// mapped, 16-byte aligned `user_rsp`, with the GDT/TSS installed.
 pub unsafe fn enter_ring3(user_rip: u64, user_rsp: u64) -> u64 {
-    // SAFETY: see contract above; the finish path resumes this frame's caller.
-    unsafe { orbita_x86_64_enter_ring3(user_rip, user_rsp) }
+    RING3_ACTIVE.store(true, Ordering::SeqCst);
+    // SAFETY: see contract above; the finish/kill path resumes this frame.
+    let code = unsafe { orbita_x86_64_enter_ring3(user_rip, user_rsp) };
+    RING3_ACTIVE.store(false, Ordering::SeqCst);
+    code
 }
 
 /// Compatibility alias for the stage-A self-test entry point.

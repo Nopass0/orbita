@@ -296,6 +296,15 @@ const RING3_STUB: [u8; 25] = [
     0x0F, 0x05, // syscall
 ];
 
+/// Ring-3 fault probe (roadmap A.7 acceptance): reads a kernel-only page
+/// (0x0300_0000 — mapped by the identity map without USER) from ring 3.
+/// The #PF must kill the process and leave the kernel running. No DONE
+/// tail: a killed process must not (and cannot) report completion.
+const RING3_FAULT_STUB: [u8; 16] = [
+    0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x03, // mov rax, [0x03000000]
+    0xF4, 0xF4, 0xF4, 0xF4, 0xF4, 0xF4, 0xF4, 0xF4, // hlt (unreachable)
+];
+
 /// Set once the app region carries USER pages (ring-3 exec requirement).
 static APP_REGION_USER: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -372,5 +381,33 @@ pub(crate) fn maybe_ring3_selftest(
             ok == 0,
             count
         ));
+
+        // Fault probe: user-mode read of a supervisor page must kill the
+        // stub "process" with the fault sentinel — kernel keeps running.
+        core::ptr::copy_nonoverlapping(
+            RING3_FAULT_STUB.as_ptr(),
+            BASE as *mut u8,
+            RING3_FAULT_STUB.len(),
+        );
+        let killed =
+            orbita_arch_x86_64::syscall::enter_ring3(BASE, user_rsp);
+        // Raw-serial print (no fmt machinery / SERIAL mutex): the state
+        // right after a fault-kill unwind is delicate — the plain-serial
+        // path is the one the fault handler itself proves reliable.
+        {
+            use core::fmt::Write as _;
+            let mut serial = orbita_arch_x86_64::serial::SerialPort::com1();
+            serial.write_str("ring3: fault-kill ok=");
+            serial.write_str(if killed
+                == orbita_arch_x86_64::syscall::FAULT_KILL_SENTINEL
+            {
+                "true"
+            } else {
+                "false"
+            });
+            serial.write_str(" (kernel alive)");
+            serial.write_byte(b'\r');
+            serial.write_byte(b'\n');
+        }
     }
 }

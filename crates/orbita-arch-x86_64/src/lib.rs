@@ -132,9 +132,10 @@ pub mod cpu {
     }
 
     /// Entry called by the CPU-fault stubs. Prints the fault to the serial
-    /// console (port I/O only — safe even with broken paging) and halts.
-    /// Stage-A v1: any kernel-side fault is fatal; killing the faulting
-    /// *process* instead arrives with ring-3 execution (roadmap A.7).
+    /// console (port I/O only — safe even with broken paging). A fault
+    /// from ring 3 while a user execution is active KILLS the process and
+    /// resumes the kernel (roadmap A.7: app crash ≠ OS crash); any other
+    /// fault is fatal for the kernel and halts.
     #[unsafe(no_mangle)]
     unsafe extern "C" fn orbita_x86_64_on_cpu_fault(vector: u64, frame: *const FaultFrame) {
         let frame = unsafe { *frame };
@@ -158,7 +159,16 @@ pub mod cpu {
         if frame.rip >= 0x1000 {
             dump_bytes(&mut serial, frame.rip, 16);
         }
-        let _ = serial.write_str(" stack=");
+        serial.write_byte(b'\r');
+        serial.write_byte(b'\n');
+        // User-mode fault during a ring-3 execution: kill the process,
+        // the kernel keeps running.
+        if (frame.cs & 3) == 3 && crate::syscall::ring3_active() {
+            serial.write_line("Orbita OS: user-mode fault - killing process, kernel continues");
+            // SAFETY: ring3_active() guarantees a saved kernel context.
+            unsafe { crate::syscall::kill_ring3_from_fault() }
+        }
+        let _ = serial.write_str("stack=");
         // SAFETY: best-effort diagnostic in a fatal handler.
         if frame.rsp >= 0x1000 {
             dump_bytes(&mut serial, frame.rsp, 32);

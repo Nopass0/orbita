@@ -338,12 +338,19 @@ pub(crate) fn exec_native(
         }
         RING3_EXEC.store(true, Ordering::Relaxed);
         // SAFETY: the ELF was loaded into the USER-mapped region; the
-        // stack top stays inside it; the EXIT syscall resumes this frame.
+        // stack top stays inside it; the EXIT syscall (or a user-mode CPU
+        // fault — process kill, roadmap A.7) resumes this frame.
         let code = unsafe {
             orbita_arch_x86_64::syscall::enter_ring3(entry, USER_STACK_TOP)
-        } as u32 as i32;
+        };
         RING3_EXEC.store(false, Ordering::Relaxed);
-        if code == u32::MAX as i32 && REPORTED_EXIT.load(Ordering::Relaxed) == i32::MIN {
+        if code == orbita_arch_x86_64::syscall::FAULT_KILL_SENTINEL {
+            // User-mode fault killed the process: conventional
+            // "killed by signal 11" exit code, the kernel continues.
+            REPORTED_EXIT.store(139, Ordering::Relaxed);
+        }
+        let raw = code as u32 as i32;
+        if raw == u32::MAX as i32 && REPORTED_EXIT.load(Ordering::Relaxed) == i32::MIN {
             ABI_FS.store(ptr::null_mut(), Ordering::Relaxed);
             return Err(String::from("run: ring3 process did not exit cleanly"));
         }

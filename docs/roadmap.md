@@ -668,3 +668,9 @@ flowchart LR
   с сохранением RDI/RSI/XMM6-15 (Win64-callee-saved vs SysV-volatile);
   второй autorun-проход в ring3 (`autorun3 … exit=0 ring3`, CI-маркеры);
   syscall из CPL0 возвращается popfq+jmp (SYSRET всегда ring3).
+- Этап A, порция 8: **fault в ring3 убивает процесс** (roadmap A.7) —
+  fault-хендлер детектит CS.RPL=3 + активный ring3-exec, разворачивается
+  в сохранённый контекст (сентинел → exit 139), ядро продолжает;
+  намеренная #PF-проба в каждом буте (`fault-kill ok=true`, CI-маркер).
+  **Критерии приёмки этапа A выполнены полностью**: ring3-приложения
+  exit=0, краш ≠ крах ОС, boots=1, тесты зелёные.

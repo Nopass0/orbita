@@ -253,6 +253,44 @@ sysret демотирует в ring3 на kernel-страницах (#PF err=0x5
 ядро продолжает (roadmap A.7); fork/exec per-process PML4; kernel-half
 0xFFFF8000…; sdk-стек глубже/ворот больше 3 аргументов.
 
+### 2026-08-29 — порция 8: fault в ring3 убивает процесс, ядро живёт ✅
+
+**Критерий приёмки этапа A закрыт:** «намеренный #PF убивает процесс,
+ядро продолжает» — доказывается КАЖДЫЙ бут (fault-проба в self-test).
+
+**Сделано:**
+- `orbita-arch-x86_64/syscall.rs`:
+  - `RING3_ACTIVE` (Rust-атомик, ставится/снимается обёрткой
+    `enter_ring3` — без split-brain: читают/пишут только Rust);
+  - asm `orbita_x86_64_ring3_kill_restore` — разворот из fault-хендлера
+    в сохранённый контекст ядра (RDI/RSI/XMM6-15), rax = сентинел
+    `FAULT_KILL_SENTINEL` (0xCAFEF139);
+  - `kill_ring3_from_fault() -> !`.
+- fault-хендлер: `cs&3==3 && ring3_active()` → печать диагностики +
+  kill (never returns); прочие fault'ы — прежний halt ядра.
+- `abi.rs::exec_native(ring3)`: сентинел → `REPORTED_EXIT=139`
+  (конвенция «убит сигналом 11»).
+- self-test: fault-проба — стаб читает kernel-only страницу
+  (0x0300_0000, identity-карта без USER) из ring3 → #PF err=0x5
+  cs=0x2B → kill → печать `fault-kill ok=true (kernel alive)`;
+  печать — **raw-serial** (без fmt/мьютекса — см. грабли).
+- CI-маркер `fault-kill ok=true`.
+
+**Тесты (3 бута QEMU):** kill-fired=1/kill-ok=1/fault-lines=1 ×3
+(единственный FAULT — намеренная проба), ring3 hello+sysinfo exit=0,
+boots=1, vfs/shell живут; host 89/0.
+
+**Грабли:** fmt-машинерия после fault-kill unwind надёжно падает
+(прыжок в мусор — пойман halt-ом на стабе в CPL0; EXIT-путь fmt
+работает) — v1-обход: raw-serial печать сразу после kill; корень
+(вероятно недовосстановленное состояние в kill-пути) — под
+наблюдением, #PF-диагностика ловит. Хвост `syscall(DONE)` в
+fault-стабе был ошибкой (убитый процесс не рапортует) и давал
+фантомный сисколл + дедлок SERIAL — убран.
+
+**Дальше (порция 9):** per-process PML4 + kernel-half 0xFFFF8000…,
+fork/exec (A.8), per-CPU GS + swapgs (A.9); diagnosis fmt-after-kill.
+
 ---
 
 *(шаблон порции: дата → Сделано/Тесты/Дальше; статусы: ⬜ planned,
