@@ -103,6 +103,10 @@ pub struct NetworkStack {
     pub pending_tx: Vec<Vec<u8>>,
     /// TCP endpoints (connections + listeners), stage D.2.
     pub tcp: Vec<TcpEndpoint>,
+    /// DHCP client (stage D.1): Some once `dhcp_start` ran.
+    pub dhcp: Option<crate::dhcp::DhcpClient>,
+    /// True after the DHCP lease configured an interface (marker).
+    pub dhcp_bound: bool,
     /// Accepted child connections per listener, ready for `tcp_accept`.
     tcp_accepted: Vec<(usize, usize)>,
     /// Frames addressed to our own IP: software-looped back into
@@ -120,6 +124,8 @@ impl NetworkStack {
             arp: ArpCache::new(),
             pending_tx: Vec::new(),
             tcp: Vec::new(),
+            dhcp: None,
+            dhcp_bound: false,
             tcp_accepted: Vec::new(),
             loopback_rx: Vec::new(),
             next_ip_id: 1,
@@ -275,6 +281,13 @@ impl NetworkStack {
                         destination_port: datagram.destination_port,
                         payload_length: datagram.payload.len(),
                     });
+                    // DHCP client (stage D.1): server → client port 68.
+                    if datagram.source_port == crate::dhcp::SERVER_PORT
+                        && datagram.destination_port == crate::dhcp::CLIENT_PORT
+                        && self.dhcp.is_some()
+                    {
+                        self.dhcp_input(datagram.payload);
+                    }
                 } else {
                     events.push(StackEvent::FrameDropped { reason: "udp-malformed" });
                 }
@@ -574,6 +587,123 @@ impl NetworkStack {
         } else {
             self.pending_tx.push(frame);
         }
+        true
+    }
+
+    // -----------------------------------------------------------------------
+    // DHCP client (stage D.1).
+    // -----------------------------------------------------------------------
+
+    /// Starts a DHCP exchange from the first up Ethernet interface (its
+    /// MAC becomes the client id). Safe to call once at boot.
+    pub fn dhcp_start(&mut self) -> bool {
+        let Some(interface) = self
+            .interfaces
+            .iter()
+            .find(|i| i.kind == InterfaceKind::Ethernet && i.up)
+            .cloned()
+        else {
+            return false;
+        };
+        let mut client = crate::dhcp::DhcpClient::new(interface.mac.0, 0x0B17_0001);
+        let action = client.start();
+        self.dhcp = Some(client);
+        match action {
+            crate::dhcp::DhcpAction::Transmit(payload) => {
+                self.udp_broadcast_frame(crate::dhcp::CLIENT_PORT, crate::dhcp::SERVER_PORT, &payload)
+            }
+            _ => false,
+        }
+    }
+
+    /// Feeds one inbound DHCP datagram (called from the UDP receive path).
+    fn dhcp_input(&mut self, payload: &[u8]) {
+        let Some(mut client) = self.dhcp.take() else { return };
+        match client.on_packet(payload) {
+            crate::dhcp::DhcpAction::Transmit(reply) => {
+                self.udp_broadcast_frame(crate::dhcp::CLIENT_PORT, crate::dhcp::SERVER_PORT, &reply);
+                self.dhcp = Some(client);
+            }
+            crate::dhcp::DhcpAction::Bound { address, router, subnet_mask, .. } => {
+                self.dhcp = Some(client);
+                self.dhcp_bound = true;
+                // Configure the requesting interface with the lease.
+                let prefix = subnet_mask
+                    .map(|m| m.0.iter().map(|b| b.count_ones()).sum::<u32>() as u8)
+                    .unwrap_or(24);
+                if let Some(interface) = self
+                    .interfaces
+                    .iter_mut()
+                    .find(|i| i.kind == InterfaceKind::Ethernet)
+                {
+                    interface.address = address;
+                    interface.gateway = router;
+                    interface.prefix = prefix;
+                }
+            }
+            crate::dhcp::DhcpAction::None => {
+                self.dhcp = Some(client);
+            }
+        }
+    }
+
+    /// Queues an Ethernet broadcast frame carrying a UDP datagram
+    /// (255.255.255.255 — the DHCP transport).
+    fn udp_broadcast_frame(
+        &mut self,
+        source_port: u16,
+        destination_port: u16,
+        payload: &[u8],
+    ) -> bool {
+        let Some(interface) = self
+            .interfaces
+            .iter()
+            .find(|i| i.kind == InterfaceKind::Ethernet && i.up)
+            .cloned()
+        else {
+            return false;
+        };
+        let mut frame_buf = [0u8; 14 + 20 + 8 + 288];
+        // RFC 2131: DHCP INIT-Reboot uses IP source 0.0.0.0 (no address
+        // yet) — SLIRP rejects DISCOVERs from an already-owned address.
+        let dhcp_source = Ipv4Address::new([0, 0, 0, 0]);
+        let udp_len = match crate::udp::UdpDatagram::build(
+            dhcp_source,
+            source_port,
+            Ipv4Address::new([255, 255, 255, 255]),
+            destination_port,
+            payload,
+            &mut frame_buf[14 + 20..],
+        ) {
+            Some(len) => len,
+            None => return false,
+        };
+        let ip_len = match Ipv4Header::build(
+            dhcp_source,
+            Ipv4Address::new([255, 255, 255, 255]),
+            protocol::UDP,
+            udp_len,
+            self.next_ip_id,
+            64,
+            &mut frame_buf[14..],
+        ) {
+            Some(len) => len,
+            None => return false,
+        };
+        self.next_ip_id = self.next_ip_id.wrapping_add(1);
+        let end = 14 + ip_len + udp_len;
+        let packet = frame_buf[14..end].to_vec();
+        // DHCP DISCOVER goes to the link-layer broadcast.
+        let Some(total) = EthernetFrame::build(
+            MacAddress::BROADCAST,
+            interface.mac,
+            EtherType::Ipv4,
+            &packet,
+            &mut frame_buf,
+        ) else {
+            return false;
+        };
+        self.pending_tx.push(frame_buf[..total].to_vec());
         true
     }
 

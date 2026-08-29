@@ -110,3 +110,25 @@ boots=1, все прежние маркеры; SDK unknown-none чист.
 
 **Дальше (порция 4):** RST на закрытые порты, сегментация >512 байт,
 retransmit/RTO, UDP-сокеты; DHCP (D.1).
+
+### 2026-08-29 — порция 4: DHCP-клиент (машина готова, live-пруф 🔄) 🔄
+
+**Сделано:**
+- `orbita-net/src/dhcp.rs`: кодек (BOOTP+магия+опции 53/50/54/51/1/3/55,
+  DISCOVER/OFFER/REQUEST/ACK/NAK) + клиентская машина
+  Init→Selecting→Requesting→Bound (NAK → рестарт обмена), broadcast-флаг,
+  xid-фильтрация; **5 host-тестов** (полный обмен, чужой xid, NAK,
+  мусор/BOOTREQUEST-отлів).
+- `stack.rs`: `dhcp_start()` (DISCOVER broadcast через Ethernet-интерфейс,
+  IP-source 0.0.0.0 по RFC 2131), UDP-крюк 67→68 → `dhcp_input`,
+  Bound → конфигурация интерфейса (адрес/маска→prefix/роутер),
+  `udp_broadcast_frame` (ETH+IP+UDP сборка).
+- Ядро: главный цикл запускает DHCP один раз, маркер
+  `dhcp discover sent` (получен в QEMU), `dhcp bound ok (...)` при лизе.
+
+**Честно (live-пруф не закрыт):** в QEMU SLIRP DISCOVER отправляется
+(маркер в serial), OFFER не наблюдается — ни одного входящего UDP.
+Подозреваемые: e1000 TX-путь широковещательного кадра 303 байта /
+ожидания SLIRP (опции/чексуммы). Диагностика — первая задача порции 5.
+
+**Тесты:** host net 55 (50→55), workspace **143/0**; build 0 warnings.

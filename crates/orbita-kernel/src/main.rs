@@ -840,6 +840,9 @@ fn kernel_main(boot_info: BootInfo) -> ! {
     let mut frame_counter: u32 = 0;
 
     let mut pending_scope = Some(RedrawScope::Chrome);
+    // DHCP one-shot flags (stage D.1): DISCOVER sent / lease logged.
+    let mut dhcp_started = false;
+    let mut dhcp_logged = false;
     let mut blink_scope: Option<RedrawScope> = None;
     let mut panels = PanelCache {
         total_text: String::new(),
@@ -861,6 +864,14 @@ fn kernel_main(boot_info: BootInfo) -> ! {
         // Network: drain received frames into the stack and push queued
         // replies (ARP answers, ICMP echoes) out through the e1000 NIC.
         if let Some(nic) = live_nic.as_mut() {
+            // Stage-D portion 1: start DHCP once (SLIRP answers OFFERs).
+            if !dhcp_started {
+                dhcp_started = net_stack.dhcp_start();
+                if dhcp_started {
+                    println!("Orbita OS: dhcp discover sent (txid=0x{:x})",
+                        net_stack.dhcp.as_ref().map(|c| c.transaction_id()).unwrap_or(0));
+                }
+            }
             for frame in nic.poll_rx() {
                 for event in net_stack.receive(&frame) {
                     match event {
@@ -873,6 +884,16 @@ fn kernel_main(boot_info: BootInfo) -> ! {
                         _ => {}
                     }
                 }
+            }
+            if net_stack.dhcp_bound && !dhcp_logged {
+                dhcp_logged = true;
+                let iface = net_stack
+                    .interfaces
+                    .iter()
+                    .find(|i| i.kind == orbita_net::InterfaceKind::Ethernet)
+                    .map(|i| i.summary())
+                    .unwrap_or_default();
+                println!("Orbita OS: dhcp bound ok ({iface})");
             }
             while let Some(frame) = net_stack.take_tx_frame() {
                 nic.send(&frame);

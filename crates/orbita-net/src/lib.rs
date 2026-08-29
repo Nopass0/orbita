@@ -19,6 +19,7 @@
 extern crate alloc;
 
 pub mod arp;
+pub mod dhcp;
 pub mod bluetooth;
 pub mod ethernet;
 pub mod icmp;
