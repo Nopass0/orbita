@@ -110,7 +110,7 @@ pub(crate) fn seed_shell_volume(fs: &mut MemoryVolume) -> Result<(), orbita_fs::
     // (see docs/scripting.md) — proves if/for/test/&& in the live OS.
     fs.create_file_path(
         "/etc/demo.sh",
-        b"#!/bin/sh\n# Orbita scripting language demo (docs/scripting.md)\nfor d in /etc /home /usr\ndo\n  if test -d $d\n  then\n    echo \"script dir: $d\"\n  fi\ndone\nif test -f /etc/orbita.conf\nthen\n  echo \"script: if ok (config found)\"\nelse\n  echo \"script: config missing\"\nfi\ntest -d /etc && echo \"script: and-ok\" || echo \"script: and-fail\"\ni=0\nwhile test $i -lt 3\ndo\n  i=$((i+1))\ndone\necho \"script: arith ok (i=$i)\"\necho \"script: subst ok ($(echo live))\"\n",
+        b"#!/bin/sh\n# Orbita scripting language demo (docs/scripting.md)\nfor d in /etc /home /usr\ndo\n  if test -d $d\n  then\n    echo \"script dir: $d\"\n  fi\ndone\nif test -f /etc/orbita.conf\nthen\n  echo \"script: if ok (config found)\"\nelse\n  echo \"script: config missing\"\nfi\ntest -d /etc && echo \"script: and-ok\" || echo \"script: and-fail\"\ni=0\nwhile test $i -lt 3\ndo\n  i=$((i+1))\ndone\necho \"script: arith ok (i=$i)\"\necho \"script: subst ok ($(echo live))\"\nsquare() {\n  echo \"script: fn ok ($1*$1=$(( $1 * $1 )))\"\n}\nsquare 6\ncase host in\n  host*) echo \"script: case ok\" ;;\n  *) echo \"script: case miss\" ;;\nesac\nn=0\nuntil test $n -ge 2\ndo\n  n=$((n+1))\ndone\necho \"script: until ok (n=$n)\"\n",
     )?;
     fs.create_file_path(
         "/var/lib/orbita/pkg/available.txt",

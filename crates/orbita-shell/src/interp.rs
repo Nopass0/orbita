@@ -52,8 +52,8 @@ pub const MAX_SCRIPT_DEPTH: usize = 8;
 enum Frame {
     /// `if … then … elif … else … fi`
     If { parents: bool, active: bool, taken: bool },
-    /// `while COND … done` — `cond` is the index of the `while` line.
-    While { parents: bool, active: bool, cond: usize, iterations: usize },
+    /// `while/until COND … done` — `cond` is the index of the loop line.
+    While { parents: bool, active: bool, cond: usize, iterations: usize, until: bool },
     /// `for VAR in WORDS … done`
     For {
         parents: bool,
@@ -61,6 +61,13 @@ enum Frame {
         words: Vec<String>,
         next: usize,
         body: usize,
+    },
+    /// `case WORD in … esac`.
+    Case {
+        parents: bool,
+        word: String,
+        matched: bool,
+        in_branch: bool,
     },
 }
 
@@ -71,6 +78,7 @@ impl Frame {
             Frame::If { parents, active, .. } => *parents && *active,
             Frame::While { parents, active, .. } => *parents && *active,
             Frame::For { parents, .. } => *parents,
+            Frame::Case { parents, in_branch, .. } => *parents && *in_branch,
         }
     }
 
@@ -79,7 +87,8 @@ impl Frame {
         match self {
             Frame::If { parents, .. }
             | Frame::While { parents, .. }
-            | Frame::For { parents, .. } => *parents,
+            | Frame::For { parents, .. }
+            | Frame::Case { parents, .. } => *parents,
         }
     }
 }
@@ -142,13 +151,16 @@ pub fn run_script<O: ShellOutput>(
                     output.write_line("script: fi without if");
                 }
             }
-            Some("while") => {
-                let cond_ok = executing && run_cond(runtime, env, fs, output, host, rest);
+            Some("while") | Some("until") => {
+                let until = keyword == Some("until");
+                // `until` loops while the condition is FALSE.
+                let cond_ok = executing && run_cond(runtime, env, fs, output, host, rest) != until;
                 stack.push(Frame::While {
                     parents: executing,
                     active: cond_ok,
                     cond: index,
                     iterations: 0,
+                    until,
                 });
             }
             Some("for") => {
@@ -185,9 +197,10 @@ pub fn run_script<O: ShellOutput>(
                 }
             }
             Some("done") => match stack.last_mut() {
-                Some(Frame::While { parents, active, cond, iterations }) => {
+                Some(Frame::While { parents, active, cond, iterations, until }) => {
                     let parent_ok = *parents;
                     let cond_line = *cond;
+                    let invert = *until;
                     if parent_ok {
                         let iters = *iterations + 1;
                         *iterations = iters;
@@ -195,11 +208,11 @@ pub fn run_script<O: ShellOutput>(
                             output.write_line("script: loop iteration limit reached");
                             stack.pop();
                         } else {
-                            let again = run_line_at(
-                                runtime, env, fs, output, host, &lines, cond_line,
+                            let cond_ok = run_line_at(
+                                runtime, env, fs, output, host, &lines, cond_line, invert,
                             );
-                            *active = again == 0;
-                            if again == 0 {
+                            *active = cond_ok;
+                            if cond_ok {
                                 index = cond_line + 1;
                                 continue;
                             }
@@ -257,9 +270,111 @@ pub fn run_script<O: ShellOutput>(
                 let code = rest.trim().parse::<i32>().map(|c| c as u32).unwrap_or(env.last_status());
                 return code;
             }
+            Some("return") if executing => {
+                // Function/script body exit: stops this run_script scope.
+                return rest.trim().parse::<i32>().map(|c| c as u32).unwrap_or(env.last_status());
+            }
+            Some("case") if rest.ends_with("in") => {
+                // `case WORD in`
+                let word_raw = rest.strip_suffix("in").unwrap_or(rest).trim_end().trim();
+                let word = crate::runtime::expand_argument(
+                    env,
+                    &CommandArg::new(word_raw.to_string(), false, true),
+                );
+                stack.push(Frame::Case {
+                    parents: executing,
+                    word,
+                    matched: false,
+                    in_branch: false,
+                });
+            }
+            Some("esac") => {
+                if stack.pop().is_none() {
+                    output.write_line("script: esac without case");
+                }
+            }
             _ => {
+                // `case` pattern lines: matched against the frame word even
+                // when the frame is not executing (to find the branch).
+                if let Some(Frame::Case { parents: true, word, matched, in_branch }) = stack.last_mut() {
+                    if !*in_branch {
+                        if let Some((pattern, tail)) = split_case_pattern(line) {
+                            let word = word.clone();
+                            if !*matched && case_pattern_matches(&word, &pattern) {
+                                *matched = true;
+                                let tail = tail.trim();
+                                let one_line = tail.ends_with(";;");
+                                let tail = tail.strip_suffix(";;").unwrap_or(tail).trim();
+                                if !tail.is_empty() {
+                                    run_cond(runtime, env, fs, output, host, tail);
+                                }
+                                // `pat) cmd ;;` closes the branch inline.
+                                *in_branch = !one_line;
+                            }
+                            index += 1;
+                            continue;
+                        }
+                    }
+                }
                 if executing {
-                    run_cond(runtime, env, fs, output, host, line);
+                    // `case` pattern line? (`pat) body ;;` / `pat)`)
+                    // `;;` closes the current case branch.
+                    if line == ";;" {
+                        if let Some(Frame::Case { in_branch, .. }) = stack.last_mut() {
+                            *in_branch = false;
+                        }
+                        index += 1;
+                        continue;
+                    }
+                    // Trailing `;;` on a body line ends the branch.
+                    let mut body = line;
+                    let mut closed_branch = false;
+                    if let Some(stripped) = line.strip_suffix(";;") {
+                        body = stripped.trim();
+                        closed_branch = true;
+                    }
+                    if !body.is_empty() {
+                        // Function definition: `name() {` … `}`.
+                        if let Some(name) = parse_function_head(body) {
+                            let mut collected = String::new();
+                            let mut close = index + 1;
+                            while close < lines.len() && lines[close] != "}" {
+                                collected.push_str(lines[close].as_str());
+                                collected.push('\n');
+                                close += 1;
+                            }
+                            env.set_function(name, collected);
+                            index = (close + 1).min(lines.len());
+                            continue;
+                        }
+                        // Function call: first word resolves to a body.
+                        let first = body.split_whitespace().next().unwrap_or("");
+                        if let Some(function) = env.function(first).map(str::to_string) {
+                            let params: Vec<String> = body
+                                .split_whitespace()
+                                .skip(1)
+                                .map(|w| {
+                                    crate::runtime::expand_argument(
+                                        env,
+                                        &CommandArg::new(w.to_string(), false, true),
+                                    )
+                                })
+                                .collect();
+                            let saved = stash_positional(env, &params);
+                            run_script(
+                                runtime, env, fs, output, host, &function, depth + 1,
+                            );
+                            restore_positional(env, &saved);
+                            index += 1;
+                            continue;
+                        }
+                        run_cond(runtime, env, fs, output, host, body);
+                    }
+                    if closed_branch {
+                        if let Some(Frame::Case { in_branch, .. }) = stack.last_mut() {
+                            *in_branch = false;
+                        }
+                    }
                 }
             }
         }
@@ -267,7 +382,11 @@ pub fn run_script<O: ShellOutput>(
     }
 
     if !stack.is_empty() {
-        output.write_line("script: unterminated block");
+        // Early `return`/`exit` from nested blocks leaves frames open —
+        // only warn for real unterminated blocks at this scope's depth.
+        if !stack.is_empty() && depth == 0 {
+            output.write_line("script: unterminated block");
+        }
     }
     env.last_status()
 }
@@ -304,14 +423,17 @@ fn run_line_at<O: ShellOutput>(
     host: &mut dyn ShellHost,
     lines: &[String],
     cond_index: usize,
-) -> u32 {
+    invert: bool,
+) -> bool {
+    // Returns "keep looping?": `until` inverts the condition.
     let line = lines[cond_index].as_str();
-    let rest = line.strip_prefix("while").unwrap_or(line).trim();
-    if !run_cond(runtime, env, fs, output, host, rest) {
-        1
-    } else {
-        0
-    }
+    let rest = line
+        .strip_prefix("while")
+        .or_else(|| line.strip_prefix("until"))
+        .unwrap_or(line)
+        .trim();
+    let cond_ok = run_cond(runtime, env, fs, output, host, rest);
+    cond_ok != invert
 }
 
 /// Splits `keyword rest` when the line starts with a control keyword.
@@ -321,7 +443,8 @@ fn split_keyword(line: &str) -> (Option<&str>, &str) {
         None => (line, ""),
     };
     const KEYWORDS: &[&str] = &[
-        "if", "then", "elif", "else", "fi", "while", "do", "done", "for", "break", "continue", "exit",
+        "if", "then", "elif", "else", "fi", "while", "until", "do", "done", "for", "break",
+        "continue", "exit", "return", "case", "esac",
     ];
     if KEYWORDS.contains(&first) {
         (Some(first), rest)
@@ -370,6 +493,76 @@ fn find_matching_done(lines: &[String], from: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// `name() {` — function definition head; returns the name.
+pub(crate) fn parse_function_head(line: &str) -> Option<&str> {
+    let (head, tail) = line.split_once("() ")?; // "name() {"
+    if tail.trim() != "{" || head.contains(' ') || head.is_empty() {
+        return None;
+    }
+    let mut chars = head.chars();
+    let valid = {
+        let Some(first) = chars.next() else { return None };
+        (first == '_' || first.is_ascii_alphabetic())
+            && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+    };
+    valid.then_some(head)
+}
+
+/// Splits a `case` pattern line `pattern) tail` (no leading keyword).
+/// Alternatives use `|` inside the pattern (`a|b)`).
+fn split_case_pattern(line: &str) -> Option<(&str, &str)> {
+    let close = line.find(')')?;
+    let pattern = line[..close].trim();
+    if pattern.is_empty() {
+        return None;
+    }
+    Some((pattern, &line[close + 1..]))
+}
+
+/// `case` pattern match: `*` wildcard anywhere (prefix/suffix segments),
+/// `|`-alternatives. No `?`/`[]` (documented).
+fn case_pattern_matches(word: &str, pattern: &str) -> bool {
+    pattern.split('|').any(|alt| {
+        let alt = alt.trim();
+        if alt == "*" {
+            return true;
+        }
+        match alt.split_once('*') {
+            None => word == alt,
+            Some((prefix, suffix)) => {
+                word.len() >= prefix.len() + suffix.len()
+                    && word.starts_with(prefix)
+                    && word.ends_with(suffix)
+            }
+        }
+    })
+}
+
+/// Sets `$1..$9`, `$#` for a function/script invocation; returns the
+/// previous values for restoration.
+fn stash_positional(env: &mut ShellEnvironment, params: &[String]) -> Vec<(String, Option<String>)> {
+    let mut saved = Vec::new();
+    for slot in 1..=9u32 {
+        let name = slot.to_string();
+        saved.push((name.clone(), env.vars().get(&name).cloned()));
+        let value = params.get(slot as usize - 1).cloned().unwrap_or_default();
+        env.set_var(name, value);
+    }
+    saved.push((String::from("#"), env.vars().get("#").cloned()));
+    env.set_var("#", params.len().to_string());
+    saved
+}
+
+/// Restores positional parameters after a function/script body ran.
+fn restore_positional(env: &mut ShellEnvironment, saved: &[(String, Option<String>)]) {
+    for (name, value) in saved {
+        match value {
+            Some(text) => env.set_var(name.clone(), text.clone()),
+            None => env.set_var(name.clone(), String::new()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -526,5 +719,49 @@ mod tests {
     fn arithmetic_with_variables_and_precedence() {
         let (_, text, _) = fixture("a=6\nb=7\necho $((a*b)) $(( (a+b)/2 )) $((a < b))\n");
         assert!(text.contains("42 6 1"));
+    }
+
+    #[test]
+    fn functions_define_call_and_positionals() {
+        let (_, text, _) = fixture(
+            "greet() {\n  echo hello-$1 count=$#\n}\ngreet world\ngreet a b\n",
+        );
+        assert!(text.contains("hello-world count=1"), "GOT: {text}");
+        assert!(text.contains("hello-a count=2"), "GOT: {text}");
+    }
+
+    #[test]
+    fn function_with_control_flow_and_return() {
+        let (_, text, _) = fixture(
+            "classify() {\n  if test $1 = bad\n  then\n    return 1\n  fi\n  echo good:$1\n}\nclassify ok\nclassify bad\necho after\n",
+        );
+        assert!(text.contains("good:ok"), "GOT: {text}");
+        assert!(!text.contains("good:bad"), "GOT: {text}");
+        assert!(text.contains("after"), "GOT: {text}");
+    }
+
+    #[test]
+    fn case_dispatch_with_wildcard_and_alternatives() {
+        let (_, text, _) = fixture(
+            "for f in a.txt b.c z q\n\ndo\n  case $f in\n    *.txt) echo text:$f ;;\n    *.c|q) echo alt:$f ;;\n    *) echo other:$f ;;\n  esac\ndone\n",
+        );
+        assert!(text.contains("text:a.txt"), "GOT: {text}");
+        assert!(text.contains("alt:b.c"), "GOT: {text}");
+        assert!(text.contains("alt:q"), "GOT: {text}");
+        assert!(text.contains("other:z"), "GOT: {text}");
+    }
+
+    #[test]
+    fn until_loop_runs_until_true() {
+        let (_, text, _) = fixture(
+            "n=0\nuntil test $n -ge 2\ndo\n  n=$((n+1))\ndone\necho n=$n\n",
+        );
+        assert!(text.contains("n=2"), "GOT: {text}");
+    }
+
+    #[test]
+    fn paren_after_arith_survives() {
+        let (_, text, _) = fixture("echo \"ok (6*6=$(( 6 * 6 )))\"\n");
+        assert!(text.contains("(6*6=36)"), "GOT: {text:?}");
     }
 }

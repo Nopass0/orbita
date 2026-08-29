@@ -49,6 +49,7 @@ pub struct ShellEnvironment {
     cwd: String,
     history: Vec<String>,
     vars: BTreeMap<String, String>,
+    functions: BTreeMap<String, String>,
     last_status: u32,
     system: ShellSystemInfo,
     active_app: String,
@@ -69,10 +70,21 @@ impl ShellEnvironment {
             cwd: String::from("/"),
             history: Vec::new(),
             vars,
+            functions: BTreeMap::new(),
             last_status: 0,
             system,
             active_app: String::from("terminal"),
         }
+    }
+
+    /// Defines (or replaces) a shell function body (scripting language).
+    pub fn set_function(&mut self, name: impl Into<String>, body: impl Into<String>) {
+        self.functions.insert(name.into(), body.into());
+    }
+
+    /// Looks up a function definition.
+    pub fn function(&self, name: &str) -> Option<&str> {
+        self.functions.get(name).map(String::as_str)
     }
 
     pub fn cwd(&self) -> &str {
@@ -1383,9 +1395,11 @@ fn expand_argument_from(
                     Some(number) => out.push_str(&number.to_string()),
                     // Division by zero / syntax error: keep the text as-is
                     // so the failure is visible in the output.
-                    None => out.push_str(&chars[index..end + 3].iter().collect::<String>()),
+                    None => out.push_str(&chars[index..end + 2].iter().collect::<String>()),
                 }
-                index = end + 3;
+                // `end` points at the first `)` of the closing pair: skip
+                // exactly the two parens.
+                index = end + 2;
                 continue;
             }
         }
@@ -1403,9 +1417,16 @@ fn expand_argument_from(
             }
         }
 
+        // Single-character special parameters: `$?`, `$#`.
+        if index + 1 < chars.len() && (chars[index + 1] == '?' || chars[index + 1] == '#') {
+            let name: String = chars[index + 1..index + 2].iter().collect();
+            out.push_str(resolve_var(env, vars, &name).as_str());
+            index += 2;
+            continue;
+        }
         let mut end = index + 1;
         while end < chars.len()
-            && (chars[end] == '_' || chars[end].is_ascii_alphanumeric() || chars[end] == '?')
+            && (chars[end] == '_' || chars[end].is_ascii_alphanumeric())
         {
             end += 1;
         }

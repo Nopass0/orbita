@@ -189,3 +189,38 @@ test -d /etc && echo "script: and-ok" || echo "script: and-fail"
 pkg update && pkg install python3 || exit 1
 pkg list | grep python
 ```
+
+## 6. Функции, case, until
+
+### Функции
+```sh
+greet() {
+    echo "hello $1 (args: $#)"
+}
+greet world        # → hello world (args: 1)
+```
+Тело — команды и любые конструкции языка (if/for/case/…). Позиционные
+параметры: `$1..$9`, `$#`; они же работают в запущенном скрипте
+(`sh x.sh a b` → `$1=a`, `$2=b`). `return N` завершает тело. Переменные
+общие с вызывающим скриптом (`local` нет — v1).
+
+### case
+```sh
+case $name in
+    *.txt) echo text file ;;
+    *.c|*.h) echo source ;;
+    *) echo other ;;
+esac
+```
+Паттерны: `*`-глоб (префикс/суффикс), альтернативы через `|`, `*` —
+всё. Однострочные ветви `pat) cmd ;;` и многострочные
+(`pat)` … `;;`) обе поддержаны. `?`/`[]` нет (v1).
+
+### until
+```sh
+n=0
+until test $n -ge 2   # цикл, пока условие ЛОЖНО
+do
+    n=$((n+1))
+done
+```
