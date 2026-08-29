@@ -39,6 +39,11 @@ const STATUS_LU: u32 = 1 << 1; // link up
 const EERD_START: u32 = 1 << 0;
 const EERD_DONE: u32 = 1 << 4;
 const RXCTRL_EN: u32 = 1 << 1;
+// Accept broadcast (DHCP/ARP) and multicast (IPv6 ND) frames.
+const RXCTRL_BAM: u32 = 1 << 15;
+const RXCTRL_MPE: u32 = 1 << 19;
+ // Strip the trailing CRC from received frames.
+const RXCTRL_SECRC: u32 = 1 << 26;
 const TCTL_EN: u32 = 1 << 1;
 const TCTL_PSP: u32 = 1 << 3;
 
@@ -222,7 +227,10 @@ impl E1000 {
         // Standard inter-packet gap for 1000 Mb/s full duplex.
         self.write32(REG_TIPG, 6 | (8 << 10) | (6 << 20));
         // Receiver on.
-        self.write32(REG_RXCTRL, RXCTRL_EN);
+        self.write32(
+            REG_RXCTRL,
+            RXCTRL_EN | RXCTRL_BAM | RXCTRL_MPE | RXCTRL_SECRC,
+        );
         Ok(())
     }
 
@@ -280,6 +288,12 @@ impl E1000 {
     /// Live counters for `netcfg`.
     pub fn stats(&self) -> E1000Stats {
         self.stats
+    }
+
+    /// Raw RX head register (diagnostics: whether the NIC writes
+    /// descriptors at all).
+    pub fn rx_head_debug(&self) -> u32 {
+        self.read32(REG_RDH)
     }
 
     /// Drain every completed RX descriptor, copying frames out.

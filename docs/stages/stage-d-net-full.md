@@ -137,3 +137,23 @@ retransmit/RTO, UDP-сокеты; DHCP (D.1).
 OFFER ОТ SLIRP ПРИХОДИТ на NIC (оба в дампе), ни одного drop-ивента:
 кадр не всплывает из `e1000 poll_rx()` вовсе. Точная цель следующей
 порции — RX-дескрипторы/кольцо e1000 (TX подтверждён).
+
+### 2026-08-29 — порция 5: DHCP live — лиз от SLIRP ✅ (RCTL-фикс e1000)
+
+**Корневой баг RX:** `RCTL` программировался только с EN — без **BAM**
+(broadcast) и **MPE** (multicast). Юникаст-ARP поэтому всегда работал,
+а broadcast-DHCP-OFFER и multicast-IPv6-шум отбрасывались железом
+молча (RDH=0 вечно — доказано зондом `rx_head_debug`; filter-dump PCAP
+показывал кадры на NIC). Фикс: `EN|BAM|MPE|SECRC`.
+
+**Результат (каждый бут, CI-маркер):**
+```
+dhcp discover sent (txid=0xb170001)
+dhcp bound ok (eth-e1000 10.0.2.15/24 gw=10.0.2.2 up)
+```
+Полный обмен DISCOVER→OFFER→REQUEST→ACK живьём против QEMU SLIRP,
+интерфейс конфигурируется лизом (адрес/маска→prefix/роутер).
+
+**Тесты:** QEMU ×2: dhcp=1, tcp=2 (ring0+ring3), ring3, kill, script,
+boots=1; host 143/0. `rx_head_debug` оставлен в драйвере как
+диагностический API.
