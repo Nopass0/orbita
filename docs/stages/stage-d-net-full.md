@@ -78,3 +78,35 @@ workspace **114/0**; QEMU ×3: tcp=1/1/1, kill-ok, ring3, boots=1.
 
 **Дальше (порция 3):** SDK-сокеты (`sys::net::TcpStream` через ABI v2),
 retransmit/RTO, RST на закрытые порты, сегментация >512 байт, DHCP.
+
+### 2026-08-29 — порция 3: сокеты в приложениях (SDK TcpStream) ✅
+
+**Сделано:**
+- `orbita-abi`: номера 20–24 (SOCKET_CONNECT/SEND/RECV/CLOSE/STATE).
+- Ядро `abi.rs`: NET_STACK-глобал (+install), TCP_SERVICE-хук, обработчики
+  сокетов с сервисными раундами `tcp_progress` (pump + echo) внутри
+  syscall — приложения делают прогресс без главного цикла.
+- Ядро `main.rs`: echo-сервис на 127.0.0.1:9090 (listener + conn,
+  CloseWait-рециклинг — закрытая стороной клиента сессия завершается и
+  принимается новая).
+- SDK `sys::net::TcpStream`: connect("ip:port")/write/read/close +
+  BadAddress/ConnectFailed; парсинг dotted-quad.
+- `sysinfo`: живой TCP-раундтрип через сокеты (`[app] net tcp echo ok:
+  orbita-net`, CI-маркер).
+
+**Грабли (важно, в логах выше):**
+- **Контракт регистров syscall-шлюза**: kernel-диспетчер (Win64) калечит
+  ВСЕ volatile-регистры (rax rcx rdx r8-r11), а SDK-asm объявлял только
+  rcx/r11 — LLVM держал значение в rdx живым через syscall → мусорный
+  req-указатель/нули (поймано дизассемблом приложения: `mov %rdx,%rdi`
+  без перезагрузки rdx). Фикс: полный clobber-набор в SDK `raw()`.
+- Два живых `&mut` на NetworkStack через AtomicPtr (UB) — явная передача
+  `&mut` в tcp_progress.
+- Echo-сервис не принимал новое соединение, пока держал полузакрытое
+  (CloseWait) — рециклинг.
+
+**Тесты:** host 138/0; QEMU ×2: `net tcp echo ok` ×2 (ring0 + ring3),
+boots=1, все прежние маркеры; SDK unknown-none чист.
+
+**Дальше (порция 4):** RST на закрытые порты, сегментация >512 байт,
+retransmit/RTO, UDP-сокеты; DHCP (D.1).

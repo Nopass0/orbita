@@ -148,6 +148,18 @@ pub mod nr {
     pub const NET_INTERFACES: u64 = 10;
     /// Terminate the application: `a1` = exit code. Does not return.
     pub const EXIT: u64 = 11;
+    /// TCP connect: `a1` = IPv4 (big-endian u32), `a2` = port.
+    /// `ret` = socket id, or negative status.
+    pub const SOCKET_CONNECT: u64 = 20;
+    /// Send on a socket: `a1` = id, `a2` = data ptr, `a3` = len (≤512).
+    pub const SOCKET_SEND: u64 = 21;
+    /// Receive from a socket (snapshot): `a1` = id, `a2` = buf, `a3` = cap.
+    /// `ret` = length (0 = nothing yet), negative when closed.
+    pub const SOCKET_RECV: u64 = 22;
+    /// Close a socket (FIN): `a1` = id.
+    pub const SOCKET_CLOSE: u64 = 23;
+    /// Socket state: `a1` = id. `ret` = 1 when ESTABLISHED/CLOSE-WAIT.
+    pub const SOCKET_STATE: u64 = 24;
 }
 
 /// Register-level syscall request block (one per call, on the caller stack).

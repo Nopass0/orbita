@@ -148,6 +148,7 @@ jobs:
           check "script: case ok"
           check "script: until ok (n=2)"
           check "tcp loopback echo ok"
+          check "net tcp echo ok: orbita-net"
           check "autorun3 hello exit=0 ring3"
           check "autorun3 sysinfo exit=0 ring3"
           check "fault-kill ok=true"

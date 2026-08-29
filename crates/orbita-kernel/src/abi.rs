@@ -477,6 +477,45 @@ extern "sysv64" fn abi_report_exit(code: i32) {
 /// returning).
 static RING3_EXEC: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// The kernel network stack (installed once at boot; kernel_main never
+/// returns so the pointer stays valid — same lifetime model as ABI_FS).
+static NET_STACK: core::sync::atomic::AtomicPtr<orbita_net::NetworkStack> =
+    core::sync::atomic::AtomicPtr::new(ptr::null_mut());
+
+/// Services the stack between socket polls (accept/echo on listeners).
+/// Registered by kernel_main; called by every socket syscall so a
+/// loopback peer makes progress even without the main loop running.
+pub(crate) static TCP_SERVICE: core::sync::atomic::AtomicPtr<()> =
+    core::sync::atomic::AtomicPtr::new(ptr::null_mut());
+
+/// Installs the network stack for socket syscalls (boot init).
+pub(crate) fn install_net_stack(stack: &mut orbita_net::NetworkStack) {
+    NET_STACK.store(stack as *mut _ as *mut _, Ordering::Relaxed);
+}
+
+fn net_stack() -> Option<&'static mut orbita_net::NetworkStack> {
+    let raw = NET_STACK.load(Ordering::Relaxed);
+    if raw.is_null() {
+        return None;
+    }
+    // SAFETY: installed at boot and alive for the whole kernel lifetime.
+    Some(unsafe { &mut *raw })
+}
+
+/// One service round: pump the loopback queue and run the registered
+/// listener service (accept/echo), so application socket calls observe
+/// forward progress.
+fn tcp_progress(stack: &mut orbita_net::NetworkStack) {
+    stack.tcp_pump();
+    let service = TCP_SERVICE.load(Ordering::Relaxed);
+    if !service.is_null() {
+        let service: fn(&mut orbita_net::NetworkStack) =
+            // SAFETY: installed as a fn pointer by kernel_main.
+            unsafe { core::mem::transmute(service) };
+        service(stack);
+    }
+}
+
 /// The user load region (validated for every syscall argument).
 const USER_REGION: core::ops::Range<u64> = APP_LOAD_BASE..APP_LOAD_BASE + 0x10_0000;
 
@@ -520,7 +559,8 @@ pub(crate) fn syscall_entry(nr: u64, a1: u64, _a2: u64, _a3: u64) -> u64 {
     // Every v2 op travels through a request block in the user region.
     if !user_range_ok(a1, core::mem::size_of::<SyscallReq>() as u64) {
         orbita_platform::log_line_fmt(format_args!(
-            "syscall: rejected req ptr 0x{a1:x} (outside user region)"
+            "syscall: rejected req ptr 0x{a1:x} nr={nr} ring3={}",
+            RING3_EXEC.load(Ordering::Relaxed)
         ));
         return AbiStatus::InvalidArgument as u64;
     }
@@ -625,6 +665,92 @@ pub(crate) fn syscall_entry(nr: u64, a1: u64, _a2: u64, _a3: u64) -> u64 {
         op::TIME_MS => abi_time_ms(),
         op::OS_INFO => fill_text_buf(&OS_INFO.lock().clone(), req),
         op::NET_INTERFACES => fill_text_buf(&NET_INFO.lock().clone(), req),
+        op::SOCKET_CONNECT => {
+            let Some(stack) = net_stack() else {
+                return AbiStatus::Unsupported as i64 as u64;
+            };
+            let ip = orbita_net::Ipv4Address::new([
+                (req.a1 >> 24) as u8,
+                (req.a1 >> 16) as u8,
+                (req.a1 >> 8) as u8,
+                req.a1 as u8,
+            ]);
+            match stack.tcp_connect(ip, req.a2 as u16) {
+                // Complete the handshake synchronously where possible
+                // (loopback resolves in one round).
+                Some(id) => {
+                    for _ in 0..4 {
+                        tcp_progress(stack);
+                        if stack.tcp_state(id)
+                            == orbita_net::tcp_state::TcpState::Established
+                        {
+                            break;
+                        }
+                    }
+                    id as u64
+                }
+                None => AbiStatus::IoError as i64 as u64,
+            }
+        }
+        op::SOCKET_SEND => {
+            let Some(stack) = net_stack() else {
+                return AbiStatus::Unsupported as i64 as u64;
+            };
+            let (ptr, len) = (req.a2, req.a3.min(512) as usize);
+            if !user_range_ok(ptr, len as u64) {
+                return AbiStatus::InvalidArgument as i64 as u64;
+            }
+            // SAFETY: validated user-range bytes.
+            let data = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+            let ok = stack.tcp_send(req.a1 as usize, data);
+            tcp_progress(stack);
+            (ok as u8).max(0) as u64
+        }
+        op::SOCKET_RECV => {
+            let Some(stack) = net_stack() else {
+                return AbiStatus::Unsupported as i64 as u64;
+            };
+            // Give the peer a chance to answer (loopback echo services
+            // run inside tcp_progress).
+            for _ in 0..4 {
+                tcp_progress(stack);
+                let data = stack.tcp_take_rx(req.a1 as usize);
+                if !data.is_empty() {
+                    let cap = req.a3 as usize;
+                    if data.len() > cap || !user_range_ok(req.a2, cap as u64) {
+                        return AbiStatus::BufferTooSmall as i64 as u64;
+                    }
+                    // SAFETY: validated user-range buffer.
+                    unsafe { ptr::copy_nonoverlapping(data.as_ptr(), req.a2 as *mut u8, data.len()) };
+                    return data.len() as u64;
+                }
+            }
+            match stack.tcp_state(req.a1 as usize) {
+                orbita_net::tcp_state::TcpState::Closed => {
+                    AbiStatus::IoError as i64 as u64
+                }
+                _ => 0, // nothing yet — poll again later
+            }
+        }
+        op::SOCKET_CLOSE => {
+            let Some(stack) = net_stack() else {
+                return AbiStatus::Unsupported as i64 as u64;
+            };
+            let ok = stack.tcp_close(req.a1 as usize);
+            tcp_progress(stack);
+            ok as u8 as u64
+        }
+        op::SOCKET_STATE => {
+            let Some(stack) = net_stack() else {
+                return 0;
+            };
+            tcp_progress(stack);
+            matches!(
+                stack.tcp_state(req.a1 as usize),
+                orbita_net::tcp_state::TcpState::Established
+                    | orbita_net::tcp_state::TcpState::CloseWait
+            ) as u64
+        }
         op::EXIT => {
             let code = req.a1 as u32 as i32;
             REPORTED_EXIT.store(code, Ordering::Relaxed);

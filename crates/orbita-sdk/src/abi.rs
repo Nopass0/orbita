@@ -20,11 +20,17 @@ pub use orbita_abi::nr;
 
 /// Raw syscall: `rax` = `req.nr`, `rdi` = `&req`. Returns `rax` and
 /// mirrors it into `req.ret`.
+///
+/// The kernel-side dispatcher is Win64 code: it clobbers every volatile
+/// register (`rax rcx rdx r8-r11`), so all of them are declared here —
+/// LLVM may otherwise keep values live across the `syscall` that the
+/// gate destroys (bit us in stage D.3: `rdx` held a stale pointer).
 #[inline]
 pub fn raw(req: &mut SyscallReq) -> u64 {
     let ret: u64;
     // SAFETY: the syscall instruction clobbers rcx/r11 by architecture
-    // definition; the kernel side preserves everything else.
+    // definition; the kernel gate additionally clobbers rdx/r8/r9/r10
+    // (Win64 dispatcher). Everything else is preserved by the gate.
     unsafe {
         asm!(
             "syscall",
@@ -32,6 +38,10 @@ pub fn raw(req: &mut SyscallReq) -> u64 {
             in("rdi") req as *mut SyscallReq as u64,
             lateout("rax") ret,
             out("rcx") _,
+            out("rdx") _,
+            out("r8") _,
+            out("r9") _,
+            out("r10") _,
             out("r11") _,
             options(nostack)
         );

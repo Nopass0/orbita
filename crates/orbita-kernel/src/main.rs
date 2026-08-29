@@ -295,6 +295,12 @@ fn kernel_main(boot_info: BootInfo) -> ! {
     );
     let local_apic = probe_local_apic();
     let idt = install_bootstrap_idt();
+    // Stage-D portion 3: socket syscalls need the live stack + an echo
+    // service on 127.0.0.1:9090 so SDK `TcpStream` apps have a peer.
+    abi::install_net_stack(&mut net_stack);
+    ECHO_LISTENER.store(net_stack.tcp_listen(9090), core::sync::atomic::Ordering::Relaxed);
+    // SAFETY: plain fn pointer, alive for the whole boot.
+    abi::TCP_SERVICE.store(tcp_echo_service as *mut (), core::sync::atomic::Ordering::Relaxed);
     // Stage-D portion 2: TCP loopback self-test — full software path
     // (handshake → echo → close) through the real frame/checksum code,
     // no NIC involved.
@@ -1090,6 +1096,47 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     let _ = write!(&mut message, "Orbita OS panic: {info}");
     platform::log_line(&message);
     platform::halt_forever()
+}
+
+/// Echo-service listener slot (stage D.3), `usize::MAX` = none.
+static ECHO_LISTENER: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+/// Active echo connection, `usize::MAX` = idle.
+static ECHO_CONN: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Socket-syscall service round: pump the stack, accept on 9090, echo
+/// whatever the peer sent. Runs inside socket syscalls (apps make
+/// forward progress without the main loop) and in the main loop.
+fn tcp_echo_service(stack: &mut orbita_net::NetworkStack) {
+    stack.tcp_pump();
+    let listener = ECHO_LISTENER.load(core::sync::atomic::Ordering::Relaxed);
+    if listener == usize::MAX {
+        return;
+    }
+    if ECHO_CONN.load(core::sync::atomic::Ordering::Relaxed) == usize::MAX {
+        if let Some(conn) = stack.tcp_accept(listener) {
+            ECHO_CONN.store(conn, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let conn = ECHO_CONN.load(core::sync::atomic::Ordering::Relaxed);
+    if conn != usize::MAX {
+        let data = stack.tcp_take_rx(conn);
+        if !data.is_empty() {
+            stack.tcp_send(conn, &data);
+        }
+        use orbita_net::tcp_state::TcpState;
+        match stack.tcp_state(conn) {
+            // Peer closed (half-closed): finish our side and go idle.
+            TcpState::CloseWait => {
+                stack.tcp_close(conn);
+            }
+            TcpState::Closed => {
+                ECHO_CONN.store(usize::MAX, core::sync::atomic::Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn on_timer_irq(_: u8) {
