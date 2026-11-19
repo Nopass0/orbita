@@ -23,6 +23,8 @@ members = [
     "crates/orbita-sync",
     "crates/orbita-threading",
     "crates/orbita-video",
+    "crates/orbita-ui",
+    "crates/orbita-virgl",
 ]
 resolver = "2"
 

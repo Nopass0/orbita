@@ -1,0 +1,23 @@
+[package]
+name = "orbita-ui"
+description = "Дизайн-система Orbita OS: токены, анимации, отрисовка, оболочка и базовые приложения (no_std + alloc)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = ["system"]
+# Готовая реализация SystemPort поверх orbita-shell + orbita-fs
+# (терминал и проводник работают с настоящим shell'ом ОС).
+system = ["dep:orbita-shell", "dep:orbita-fs"]
+
+[dependencies]
+ab_glyph = { version = "0.2.29", default-features = false, features = ["libm", "variable-fonts"] }
+hashbrown = { version = "0.15", default-features = false, features = ["default-hasher"] }
+libm = "0.2.11"
+orbita-shell = { path = "../orbita-shell", optional = true }
+orbita-fs = { path = "../orbita-fs", optional = true }
+
+[dev-dependencies]
+png = "0.17"

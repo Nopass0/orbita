@@ -17,6 +17,9 @@ mod ps2;
 mod smp;
 mod timer;
 mod transport;
+pub mod virtio;
+pub mod virtio_gpu;
+pub mod virtio_input;
 
 pub use ahci::{AhciDisk, AhciError, StorageKind, set_debug_hook};
 pub use e1000::{E1000, E1000Error, E1000Stats};
@@ -29,7 +32,7 @@ pub use irq::{
     IRQ_BASE_VECTOR, IdtInstallReport, InterruptLine, IrqEdge, IrqPolarity, KEYBOARD_VECTOR,
     SPURIOUS_VECTOR, TIMER_VECTOR, dispatch, install_bootstrap_idt, register_handler,
 };
-pub use pci::{enable_bus_master, write_config_u32,
+pub use pci::{enable_bus_master, read_config_u8, read_config_u32, write_config_u32, VirtioDeviceType,
     PciAddress, PciBar, PciBarKind, PciClassCode, PciDevice, PciDeviceId, PciInventory,
     PciVendorId,
 };

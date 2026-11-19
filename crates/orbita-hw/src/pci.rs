@@ -451,7 +451,8 @@ fn read_capabilities(address: PciAddress) -> ([Option<PciCapability>; 8], usize,
     (capabilities, count, msi_capable, msix_capable, vendor_cap)
 }
 
-fn read_config_u8(address: PciAddress, offset: u8) -> u8 {
+/// Читает байт конфигурационного пространства PCI.
+pub fn read_config_u8(address: PciAddress, offset: u8) -> u8 {
     let value = read_config_u32(address, offset);
     let shift = (offset & 0x3) * 8;
     ((value >> shift) & 0xFF) as u8
@@ -480,7 +481,8 @@ pub fn enable_bus_master(address: PciAddress) {
     write_config_u32(address, 0x04, command | 0x7);
 }
 
-fn read_config_u32(address: PciAddress, offset: u8) -> u32 {
+/// Читает 32-битное слово конфигурационного пространства PCI.
+pub fn read_config_u32(address: PciAddress, offset: u8) -> u32 {
     let config_address = 0x8000_0000u32
         | ((address.bus as u32) << 16)
         | ((address.device as u32) << 11)

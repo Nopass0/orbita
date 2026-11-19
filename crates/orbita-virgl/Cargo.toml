@@ -1,0 +1,12 @@
+[package]
+name = "orbita-virgl"
+description = "GPU-рендер интерфейса Orbita через virgl (virtio-gpu 3D): кодировщик команд, TGSI-шейдеры, рендерер кадра"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+orbita-ui = { path = "../orbita-ui", default-features = false }
+hashbrown = { version = "0.15", default-features = false, features = ["default-hasher"] }
+libm = "0.2.11"

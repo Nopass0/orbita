@@ -23,4 +23,6 @@ orbita-runtime = { path = "../orbita-runtime" }
 orbita-shell = { path = "../orbita-shell" }
 orbita-std = { path = "../orbita-std" }
 orbita-video = { path = "../orbita-video" }
+orbita-ui = { path = "../orbita-ui" }
+orbita-virgl = { path = "../orbita-virgl" }
 uefi = { workspace = true, features = ["alloc"] }

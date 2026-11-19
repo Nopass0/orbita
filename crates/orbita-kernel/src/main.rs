@@ -50,6 +50,7 @@ mod ui;
 mod input;
 mod paging_setup;
 mod hosts;
+mod gui;
 
 use boot::*;
 use console::*;
@@ -59,7 +60,8 @@ use seed::*;
 use ui::*;
 use input::*;
 
-pub(crate) const HEAP_PAGES: usize = 8192;
+/// Страниц кучи: 256 МБ — атласы глифов/спрайтов, вершины GPU, обои.
+pub(crate) const HEAP_PAGES: usize = 65536;
 
 pub(crate) const NEBULAFS_FEATURES: &[FsFeature] = &[
     FsFeature::Journaling,
@@ -645,7 +647,19 @@ fn kernel_main(boot_info: BootInfo) -> ! {
                 &mut frame_allocator,
                 boot_info.memory_regions(),
                 Some((fb.base as u64, fb.size_bytes as u64)),
-                &[(local_apic.physical_base, 0x1000), (0xFEC0_0000, 0x1000)],
+                &{
+                    // 64-битные BAR'ы (virtio-gpu/virtio-input) могут лежать
+                    // выше 4 ГиБ, вне карты памяти UEFI — отображаем явно.
+                    let mut extra = alloc::vec![(local_apic.physical_base, 0x1000), (0xFEC0_0000, 0x1000)];
+                    for dev in pci_inventory.devices() {
+                        for bar in dev.bars.iter().flatten() {
+                            if bar.base >= 0x1_0000_0000 && bar.size > 0 {
+                                extra.push((bar.base, bar.size));
+                            }
+                        }
+                    }
+                    extra
+                },
                 &conf_text,
             );
             // Stage-A portion 6: ring-3 + syscall/sysret roundtrip.
@@ -859,6 +873,35 @@ fn kernel_main(boot_info: BootInfo) -> ! {
         events_text: String::new(),
     };
     panels.refresh(&mut shell_fs, &chrome, &workspace, &shell_env);
+
+    // Графический рабочий стол Orbita (дизайн-система, GPU через virgl).
+    // `ui=classic` в /etc/orbita.conf возвращает прежний текстовый цикл.
+    let classic = persistent_fs
+        .as_ref()
+        .map(|(_, _, conf)| conf.lines().any(|l| l.trim() == "ui=classic"))
+        .unwrap_or(false);
+    if !classic {
+        let refs = gui::KernelRefs {
+            fs: &mut shell_fs,
+            env: &mut shell_env,
+            procs: &mut process_engine,
+            net: &mut net_stack,
+            nic: &mut live_nic,
+            disk: &mut persistent_fs,
+        };
+        gui::run(
+            refs,
+            &pci_inventory,
+            &mut framebuffer,
+            timer_plan.quantum_hz as u64,
+            smp.logical_cpus as u32,
+            format!(
+                "{} из {}",
+                diagnostics::format_bytes(summary.usable_memory_bytes),
+                diagnostics::format_bytes(summary.total_memory_bytes)
+            ),
+        );
+    }
 
     loop {
         // Network: drain received frames into the stack and push queued
@@ -1129,7 +1172,7 @@ static ECHO_CONN: core::sync::atomic::AtomicUsize =
 /// Socket-syscall service round: pump the stack, accept on 9090, echo
 /// whatever the peer sent. Runs inside socket syscalls (apps make
 /// forward progress without the main loop) and in the main loop.
-fn tcp_echo_service(stack: &mut orbita_net::NetworkStack) {
+pub(crate) fn tcp_echo_service(stack: &mut orbita_net::NetworkStack) {
     stack.tcp_pump();
     let listener = ECHO_LISTENER.load(core::sync::atomic::Ordering::Relaxed);
     if listener == usize::MAX {
