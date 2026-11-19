@@ -775,6 +775,18 @@ mod tests {
     use crate::geom::Radii;
 
     #[test]
+    fn path_hash_includes_segments_after_the_eighth() {
+        let mut inst = Instance::default();
+        inst.params[0] = Kind::Path as u32 as f32;
+        inst.seg = [0.0, 9.0, 0.0, 0.0];
+        let mut a = [[0.0; 4]; 9];
+        a[8] = [1.0, 2.0, 3.0, 4.0];
+        let mut b = a;
+        b[8] = [1.0, 2.0, 3.0, 5.0];
+        assert_ne!(inst_hash(&inst, &a), inst_hash(&inst, &b));
+    }
+
+    #[test]
     fn rounded_corner_is_antialiased() {
         let mut p = Painter::new();
         p.begin_frame(32, 32, 1.0, Color::BLACK);

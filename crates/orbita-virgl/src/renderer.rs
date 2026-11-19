@@ -642,9 +642,11 @@ mod tests {
         d.open(orbita_ui::apps::AppKind::Terminal, None);
         let input = FrameInput { width: 640, height: 400, scale: 1.0, time: 1.0, ..Default::default() };
         let mut r = GpuRenderer::new(&mut dev, 640, 400, &d.ui.p.fonts.atlas).unwrap();
-        for i in 0..3 {
+        // The intro animation ends 2.2 seconds after the first frame. Jump
+        // past it so the cache assertion checks a genuinely stable frame.
+        for time in [1.0, 4.0, 5.0] {
             let mut inp = input.clone();
-            inp.time = 1.0 + i as f64;
+            inp.time = time;
             d.frame(&inp);
             let frame = d.ui.p.frame().clone();
             r.render(&mut dev, &frame, &mut d.ui.p.fonts.atlas).unwrap();

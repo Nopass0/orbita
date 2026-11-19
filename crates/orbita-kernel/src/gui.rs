@@ -225,6 +225,8 @@ fn calibrate_tsc(quantum_hz: u64) -> f64 {
 struct VirglDevice {
     gpu: VirtioGpu,
     ctx: u32,
+    frames_since_sync: u8,
+    backing_upload_pending: bool,
 }
 
 fn err<E: core::fmt::Debug>(e: E) -> String {
@@ -241,7 +243,9 @@ impl GpuDevice for VirglDevice {
         self.gpu.attach_backing(res, addr, len).map_err(err)
     }
     fn upload(&mut self, res: u32, x: u32, y: u32, w: u32, h: u32, offset: u64, stride: u32) -> Result<(), String> {
-        self.gpu.transfer_to_host_3d(self.ctx, res, x, y, w, h, offset, stride).map_err(err)
+        self.gpu.transfer_to_host_3d(self.ctx, res, x, y, w, h, offset, stride).map_err(err)?;
+        self.backing_upload_pending = true;
+        Ok(())
     }
     fn submit(&mut self, cmds: &[u32]) -> Result<(), String> {
         self.gpu.submit_3d(self.ctx, cmds).map_err(err)
@@ -253,7 +257,19 @@ impl GpuDevice for VirglDevice {
         self.gpu.flush(res, w, h).map_err(err)
     }
     fn finish(&mut self) -> Result<(), String> {
-        self.gpu.wait().map_err(err)
+        // GPU-команды идут последовательно в одной virtqueue, поэтому кадрам
+        // не нужно ждать CPU round-trip каждый раз. Upload читает память гостя
+        // напрямую — после него обязательно ждём до следующей мутации backing.
+        // Для обычных кадров ограничиваем очередь тремя кадрами.
+        self.frames_since_sync = self.frames_since_sync.saturating_add(1);
+        if self.backing_upload_pending || self.frames_since_sync >= 3 {
+            self.gpu.wait().map_err(err)?;
+            self.frames_since_sync = 0;
+            self.backing_upload_pending = false;
+        } else {
+            self.gpu.kick();
+        }
+        Ok(())
     }
 }
 
@@ -285,7 +301,7 @@ fn init_virgl(pci: &PciInventory) -> Option<(VirglDevice, u32, u32, String)> {
         return None;
     }
     let api = String::from("virgl · OpenGL хоста");
-    Some((VirglDevice { gpu, ctx: 1 }, w, h, api))
+    Some((VirglDevice { gpu, ctx: 1, frames_since_sync: 0, backing_upload_pending: false }, w, h, api))
 }
 
 // ------------------------------------------------------------------ клавиатура
