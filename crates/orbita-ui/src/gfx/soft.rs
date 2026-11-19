@@ -379,7 +379,11 @@ fn inst_hash(inst: &Instance, segs: &[[f32; 4]]) -> u64 {
     if inst.params[0] as u32 == Kind::Path as u32 {
         let s = inst.seg[0] as usize;
         let n = inst.seg[1] as usize;
-        for seg in segs.iter().skip(s).take(n.min(8)) {
+        // Все сегменты важны для damage tracking: несколько иконок имеют
+        // одинаковый внешний контур, но отличаются внутренними линиями.
+        // Усечение до первых восьми сегментов давало коллизию и оставляло
+        // на экране следы старой иконки после перерисовки.
+        for seg in segs.iter().skip(s).take(n) {
             for v in seg {
                 h ^= v.to_bits() as u64;
                 h = h.wrapping_mul(0x0100_0000_01b3);
