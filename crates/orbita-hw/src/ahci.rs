@@ -127,6 +127,19 @@ pub enum AhciError {
 /// Kernel-side diagnostic hook, assigned by the kernel at boot.
 static mut DEBUG_HOOK: Option<fn(core::fmt::Arguments<'_>)> = None;
 
+/// Пауза между опросами регистров контроллера.
+///
+/// Каждое чтение MMIO под гипервизором (QEMU WHPX/KVM) — выход из ВМ с
+/// захватом глобальной блокировки QEMU. Непрерывный опрос не даёт главному
+/// потоку QEMU завершить сам ввод-вывод: диск «тормозит», окно «не отвечает».
+/// ~200 инструкций `pause` (≈1 мкс) между чтениями снимают эту конкуренцию.
+#[inline]
+fn backoff() {
+    for _ in 0..200 {
+        core::hint::spin_loop();
+    }
+}
+
 pub fn set_debug_hook(hook: fn(core::fmt::Arguments<'_>)) {
     unsafe { DEBUG_HOOK = Some(hook) }
 }
@@ -181,7 +194,7 @@ impl AhciDisk {
                     break;
                 }
                 waited += 1;
-                core::hint::spin_loop();
+                backoff();
             }
             // Ack interrupts, clear errors, install our structures.
             let is = port_regs.add(REG_PXIS_OFF / 4).read_volatile();
@@ -205,7 +218,7 @@ impl AhciDisk {
                     break;
                 }
                 waited += 1;
-                core::hint::spin_loop();
+                backoff();
             }
             // QEMU raises TFES/DHRS via an initial D2H FIS when the
             // engines come on; drain those stale bits before any command.
@@ -358,23 +371,8 @@ impl AhciDisk {
             header.add(1).write_volatile(0);
             header.add(2).write_volatile(self.cmd_table as u32);
             header.add(3).write_volatile((self.cmd_table as u64 >> 32) as u32);
-            {
-                let t = self.cmd_table as *const u32;
-                debug_log(format_args!(
-                    "ahci: hdr dw0={:#010x} dw2={:#010x} ctba={:#x} | fis: {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} | prdt {:#010x} {:#010x} {:#010x}",
-                    header.read_volatile(),
-                    header.add(2).read_volatile(),
-                    self.cmd_table as usize,
-                    t.read_volatile(),
-                    t.add(1).read_volatile(),
-                    t.add(2).read_volatile(),
-                    t.add(3).read_volatile(),
-                    t.add(4).read_volatile(),
-                    (self.cmd_table.add(0x80) as *const u32).read_volatile(),
-                    (self.cmd_table.add(0x84) as *const u32).read_volatile(),
-                    (self.cmd_table.add(0x8C) as *const u32).read_volatile()
-                ));
-            }
+            // (Покомандный отладочный вывод убран: при форматировании диска
+            // на 10 ГБ он превращал тысячи записей секторов в минуты.)
 
             // --- Start the engine (ST) if the firmware left it stopped,
             //     keeping FIS receive (FRE) enabled. ---
@@ -420,7 +418,7 @@ impl AhciDisk {
                     ));
                     return false;
                 }
-                core::hint::spin_loop();
+                backoff();
             }
             let tfd = self.port_regs.add(REG_PXTFD_OFF / 4).read_volatile();
             if tfd & 0x01 != 0 {

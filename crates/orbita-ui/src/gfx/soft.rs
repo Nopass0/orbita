@@ -719,6 +719,14 @@ fn draw_instance(
     let x1 = area.right() as usize;
     let y1 = area.bottom() as usize;
     let kind = inst.params[0] as u32;
+    // Быстрый путь для обводки пути (волны и кольца обоев, линии): вместо
+    // перебора всех отрезков в каждом пикселе каждый отрезок обновляет
+    // поле расстояний только в своей окрестности. Стоимость — площадь
+    // вокруг линии, а не «площадь × число отрезков».
+    if kind == Kind::Path as u32 && inst.uv[3] <= 0.5 {
+        draw_stroke_splat(inst, segs, area, target, stride);
+        return;
+    }
     // Быстрый путь: сплошной прямоугольник без скругления, рамки и отсечения.
     let simple_rect = kind == Kind::Rect as u32
         && inst.grad0[0] == 0.0
@@ -753,6 +761,61 @@ fn draw_instance(
             }
             let dst = unpack(target[row + x]);
             target[row + x] = pack(src.over(dst));
+        }
+    }
+}
+
+/// Обводка пути «разбрызгиванием» расстояний (см. `draw_instance`).
+fn draw_stroke_splat(inst: &Instance, segs: &[[f32; 4]], area: Rect, target: &mut [u32], stride: usize) {
+    let x0 = area.x as i32;
+    let y0 = area.y as i32;
+    let w = area.w as i32;
+    let h = area.h as i32;
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let (ox, oy, sc) = (inst.uv[0], inst.uv[1], inst.uv[2]);
+    let hw = inst.params[3] * sc * 0.5;
+    let soft = inst.extra[2];
+    let reach = hw + soft + 1.0;
+    let mut dist = vec![f32::MAX; (w * h) as usize];
+    let start = inst.seg[0] as usize;
+    let count = inst.seg[1] as usize;
+    for s in &segs[start.min(segs.len())..(start + count).min(segs.len())] {
+        let d = [ox + s[0] * sc, oy + s[1] * sc, ox + s[2] * sc, oy + s[3] * sc];
+        let bx0 = ((math::min(d[0], d[2]) - reach) as i32 - x0).max(0);
+        let bx1 = ((math::max(d[0], d[2]) + reach) as i32 + 1 - x0).min(w);
+        let by0 = ((math::min(d[1], d[3]) - reach) as i32 - y0).max(0);
+        let by1 = ((math::max(d[1], d[3]) + reach) as i32 + 1 - y0).min(h);
+        for y in by0..by1 {
+            let py = (y0 + y) as f32 + 0.5;
+            let row = (y * w) as usize;
+            for x in bx0..bx1 {
+                let px = (x0 + x) as f32 + 0.5;
+                let dd = seg_distance(px, py, d);
+                let cell = &mut dist[row + x as usize];
+                if dd < *cell {
+                    *cell = dd;
+                }
+            }
+        }
+    }
+    for y in 0..h {
+        let py = (y0 + y) as f32 + 0.5;
+        for x in 0..w {
+            let d = dist[(y * w + x) as usize];
+            if d >= reach {
+                continue;
+            }
+            let px = (x0 + x) as f32 + 0.5;
+            let a = if soft > 0.0 { math::smoothstep(hw + soft, hw - soft, d) } else { math::clamp(hw - d + 0.5, 0.0, 1.0) };
+            let a = a * clip_coverage(inst, px, py);
+            if a <= 0.0005 {
+                continue;
+            }
+            let src = paint_at(inst, px, py).scale(a);
+            let i = (y0 + y) as usize * stride + (x0 + x) as usize;
+            target[i] = pack(src.over(unpack(target[i])));
         }
     }
 }

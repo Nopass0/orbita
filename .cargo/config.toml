@@ -1,0 +1,6 @@
+# Сборка ядра Orbita: свой таргет x86_64-orbita-uefi (UEFI + аппаратные
+# SSE/SSE2). Стандартный x86_64-unknown-uefi — soft-float: вся математика
+# f32 эмулировалась программно, и UI/растеризация шли в десятки раз
+# медленнее. Использование: `cargo kernel`.
+[alias]
+kernel = "build --release -p orbita-kernel --target targets/x86_64-orbita-uefi.json -Z json-target-spec -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem"

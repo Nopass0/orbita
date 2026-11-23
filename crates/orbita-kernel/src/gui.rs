@@ -25,7 +25,6 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
 
 use orbita_fs::{MemoryVolume, VolumeInspector};
 use orbita_hw::virtio_gpu::{Resource3d, VirtioGpu};
@@ -110,6 +109,7 @@ impl SystemPort for KernelPort {
         let mut v: Vec<DirEntry> = listing
             .entries
             .into_iter()
+            .filter(|e| !e.name.starts_with('.'))
             .map(|e| DirEntry { is_dir: e.metadata.is_directory(), size: e.metadata.size_bytes, name: e.name })
             .collect();
         v.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
@@ -155,6 +155,41 @@ impl SystemPort for KernelPort {
     }
 }
 
+/// Создаёт домашнюю папку пользователя, если её ещё нет.
+///
+/// `/home` синхронизируется на диск OrbitaFS (см. `disk::SYNCED_TREES`), но
+/// пустые каталоги при синхронизации не сохраняются — поэтому в каждой
+/// папке лежит скрытый `.keep`. Существующие файлы не перезаписываются,
+/// поэтому изменения пользователя переживают перезагрузку.
+fn seed_home(fs: &mut MemoryVolume) {
+    for d in ["Проекты", "Документы", "Загрузки", "Изображения", "Рабочий стол"] {
+        let dir = format!("/home/user/{d}");
+        let _ = fs.create_dir_all(&dir);
+        let keep = format!("{dir}/.keep");
+        if fs.read_file_path(&keep).is_err() {
+            let _ = fs.create_file_path(&keep, b"");
+        }
+    }
+    let files: [(&str, &[u8]); 3] = [
+        ("/home/user/readme.md", "# Orbita OS
+
+Добро пожаловать. Файлы в /home сохраняются на диск.
+".as_bytes()),
+        ("/home/user/hello.sh", b"echo \"Orbita shell\"
+for i in 1 2 3; do echo \"step $i\"; done
+"),
+        ("/home/user/Документы/план.txt", "1. Интерфейс на GPU
+2. Приложения
+3. Сохранение на диск
+".as_bytes()),
+    ];
+    for (path, data) in files {
+        if fs.read_file_path(path).is_err() {
+            let _ = fs.create_file_path(path, data);
+        }
+    }
+}
+
 // ------------------------------------------------------------------ RTC
 
 fn cmos(reg: u8) -> u8 {
@@ -192,31 +227,55 @@ fn read_rtc() -> WallClock {
 
 // ------------------------------------------------------------------ время
 
+static TSC_HZ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Монотонное время в секундах по откалиброванному TSC.
+fn now_s() -> f64 {
+    let hz = f64::from_bits(TSC_HZ.load(core::sync::atomic::Ordering::Relaxed));
+    if hz > 0.0 { rdtsc() as f64 / hz } else { 0.0 }
+}
+
 fn rdtsc() -> u64 {
     unsafe { core::arch::x86_64::_rdtsc() }
 }
 
-/// Калибрует частоту TSC по тикам таймера ядра.
-fn calibrate_tsc(quantum_hz: u64) -> f64 {
-    let ticks = &crate::TIMER_IRQ_COUNT;
-    let start = ticks.load(Ordering::Relaxed);
-    let mut guard = 0u64;
-    while ticks.load(Ordering::Relaxed) == start && guard < 2_000_000_000 {
-        guard += 1;
-        core::hint::spin_loop();
+/// Калибрует частоту TSC по каналу 2 PIT (1 193 182 Гц).
+///
+/// Прерывания таймера в ядре пока замаскированы, поэтому опираться на
+/// счётчик тиков нельзя: PIT канал 2 опрашивается через порт 0x61 без
+/// прерываний — классический способ BIOS/Linux. Меряем 50 мс, берём
+/// лучший из трёх замеров.
+fn calibrate_tsc() -> f64 {
+    use orbita_arch_x86_64::io::Port;
+    const PIT_HZ: f64 = 1_193_182.0;
+    const COUNT: u16 = 59_659; // ≈ 50 мс
+    let mut best = 0.0f64;
+    for _ in 0..3 {
+        let mut p61 = Port::<u8>::new(0x61);
+        let mut cmd = Port::<u8>::new(0x43);
+        let mut ch2 = Port::<u8>::new(0x42);
+        let hz = unsafe {
+            let v = p61.read();
+            p61.write((v & 0xFD) | 0x01); // gate on, динамик выключен
+            cmd.write(0xB0); // канал 2, lo/hi, режим 0
+            ch2.write((COUNT & 0xFF) as u8);
+            ch2.write((COUNT >> 8) as u8);
+            let v = p61.read();
+            p61.write(v & 0xFE);
+            p61.write(v | 0x01); // перезапуск счёта
+            let t0 = rdtsc();
+            let mut guard = 0u64;
+            while p61.read() & 0x20 == 0 && guard < 200_000_000 {
+                guard += 1;
+            }
+            let t1 = rdtsc();
+            (t1 - t0) as f64 * PIT_HZ / COUNT as f64
+        };
+        if hz > best {
+            best = hz;
+        }
     }
-    let t0 = rdtsc();
-    let s0 = ticks.load(Ordering::Relaxed);
-    let target = s0 + (quantum_hz / 10).max(2);
-    guard = 0;
-    while ticks.load(Ordering::Relaxed) < target && guard < 4_000_000_000 {
-        guard += 1;
-        core::hint::spin_loop();
-    }
-    let t1 = rdtsc();
-    let n = ticks.load(Ordering::Relaxed).saturating_sub(s0).max(1);
-    let hz = (t1 - t0) as f64 * quantum_hz as f64 / n as f64;
-    if hz < 1.0e8 { 2.0e9 } else { hz }
+    if best < 1.0e8 { 2.0e9 } else { best }
 }
 
 // ------------------------------------------------------------------ GPU
@@ -238,6 +297,9 @@ impl GpuDevice for VirglDevice {
         self.gpu
             .resource_create_3d(self.ctx, Resource3d { target: d.target, format: d.format, bind: d.bind, width: d.width, height: d.height })
             .map_err(err)
+    }
+    fn destroy_resource(&mut self, res: u32) -> Result<(), String> {
+        self.gpu.resource_unref(res).map_err(err)
     }
     fn attach_backing(&mut self, res: u32, addr: u64, len: u32) -> Result<(), String> {
         self.gpu.attach_backing(res, addr, len).map_err(err)
@@ -296,10 +358,12 @@ fn init_virgl(pci: &PciInventory) -> Option<(VirglDevice, u32, u32, String)> {
     }
     println!("Orbita OS: virgl capsets {:?}", capsets);
     let (w, h) = gpu.display_info().ok().and_then(|v| v.first().copied()).unwrap_or((1280, 800));
+    println!("Orbita OS: virgl display {}x{}", w, h);
     if let Err(e) = gpu.ctx_create(1, "orbita-ui") {
         println!("Orbita OS: virgl ctx_create failed: {e:?}");
         return None;
     }
+    println!("Orbita OS: virgl context ready");
     let api = String::from("virgl · OpenGL хоста");
     Some((VirglDevice { gpu, ctx: 1, frames_since_sync: 0, backing_upload_pending: false }, w, h, api))
 }
@@ -441,7 +505,10 @@ pub(crate) fn run(
     memory: String,
 ) -> ! {
     println!("Orbita OS: gui starting (orbita-ui design system)");
-    let tsc_hz = calibrate_tsc(quantum_hz.max(1));
+    splash_step(0.9, "Графика");
+    let _ = quantum_hz;
+    let tsc_hz = calibrate_tsc();
+    TSC_HZ.store(tsc_hz.to_bits(), core::sync::atomic::Ordering::Relaxed);
     println!("Orbita OS: tsc {} MHz", (tsc_hz / 1.0e6) as u64);
     let now = || rdtsc() as f64 / tsc_hz;
 
@@ -462,6 +529,7 @@ pub(crate) fn run(
     };
     let port = KernelPort { k, runtime: ShellRuntime::new(), info };
     unsafe {
+        seed_home(&mut *k.fs);
         let env = &mut *k.env;
         if env.cwd() == "/" {
             env.set_cwd("/home/user");
@@ -478,7 +546,8 @@ pub(crate) fn run(
 
     let mut gpu = match virgl {
         Some((mut dev, w, h, _)) => match GpuRenderer::new(&mut dev, w, h, &desktop.ui.p.fonts.atlas) {
-            Ok(r) => {
+            Ok(mut r) => {
+                r.clock = Some(now_s);
                 println!("Orbita OS: gui renderer = virgl GPU {}x{}", w, h);
                 Some((dev, r))
             }
@@ -489,12 +558,13 @@ pub(crate) fn run(
         },
         None => None,
     };
-    let (width, height) = if gpu.is_some() { (width, height) } else { (framebuffer.width() as u32, framebuffer.height() as u32) };
+    splash_end();
+    let (mut width, mut height) = if gpu.is_some() { (width, height) } else { (framebuffer.width() as u32, framebuffer.height() as u32) };
     let mut soft = SoftRenderer::new(width, height);
     let mut back = if gpu.is_none() { vec![0u32; (width * height) as usize] } else { Vec::new() };
 
     let mut keys = KeyDecoder::new();
-    let mut mouse = Vec2::new(width as f32 * 0.5, height as f32 * 0.5);
+    let mut mouse = Vec2::new(width as f32 * 0.5 / ui_scale(width, height), height as f32 * 0.5 / ui_scale(width, height));
     let mut buttons = 0u8;
     let mut fps = 0.0f32;
     let mut frames_in_window = 0u32;
@@ -505,11 +575,31 @@ pub(crate) fn run(
     let mut dhcp_started = false;
     let mut dhcp_logged = false;
     let mut logged_first = false;
+    let mut last_display_check = now();
 
     loop {
         service_network(&k, &mut dhcp_started, &mut dhcp_logged);
 
-        let mut input = FrameInput { width, height, scale: 1.0, time: now(), ..Default::default() };
+        // Окно QEMU сменило размер — подстраиваем разрешение (любой экран).
+        if now() - last_display_check > 0.25 {
+            last_display_check = now();
+            if let Some((dev, r)) = gpu.as_mut() {
+                if dev.gpu.display_changed() {
+                    if let Some((w, h)) = dev.gpu.display_info().ok().and_then(|v| v.first().copied()) {
+                        match r.resize(dev, w, h) {
+                            Ok(()) => {
+                                println!("Orbita OS: display resized to {}x{}", w, h);
+                                width = w;
+                                height = h;
+                            }
+                            Err(e) => println!("Orbita OS: resize failed: {e}"),
+                        }
+                    }
+                }
+            }
+        }
+        let scale = ui_scale(width, height);
+        let mut input = FrameInput { width, height, scale, time: now(), ..Default::default() };
         let mut budget = 64;
         while budget > 0 {
             let Some(sc) = poll_ps2_data() else { break };
@@ -518,7 +608,8 @@ pub(crate) fn run(
         }
         if let Some(t) = tablet.as_mut() {
             let s = t.poll();
-            mouse = Vec2::new(s.x * width as f32, s.y * height as f32);
+            // Указатель — в логических пикселях интерфейса.
+            mouse = Vec2::new(s.x * width as f32 / scale, s.y * height as f32 / scale);
             buttons = s.buttons;
             input.wheel = Vec2::new(0.0, -(s.wheel as f32) * 48.0);
         }
@@ -541,7 +632,7 @@ pub(crate) fn run(
                 }
                 if !logged_first {
                     logged_first = true;
-                    println!("Orbita OS: gui first frame on GPU, instances={} captures={}", r.stats.instances, r.stats.captures);
+                    println!("Orbita OS: gui first frame on GPU, instances={} captures={} baked={} wall={:.0}ms bake={:.0}ms submit={:.0}ms", r.stats.instances, r.stats.captures, r.stats.baked, r.stats.wall_ms, r.stats.bake_ms, r.stats.submit_ms);
                 }
             }
             None => {
@@ -566,6 +657,11 @@ pub(crate) fn run(
         // Изменённые файлы — на диск раз в 5 секунд.
         if t2 - last_sync > 5.0 {
             last_sync = t2;
+            let (inst, caps) = gpu.as_ref().map(|(_, r)| (r.stats.instances, r.stats.captures)).unwrap_or((0, 0));
+            println!(
+                "Orbita OS: gui stats fps={:.0} cpu={:.2}ms gpu={:.2}ms instances={} captures={}",
+                fps, cpu_ms, gpu_ms, inst, caps
+            );
             unsafe {
                 if let Some((diskfs, disk, _)) = (*k.disk).as_mut() {
                     let n = sync_ram_to_disk(diskfs, disk, &mut *k.fs);
@@ -578,10 +674,24 @@ pub(crate) fn run(
     }
 }
 
+/// Масштаб интерфейса под разрешение: на больших экранах элементы
+/// крупнее, чтобы сохранить физический размер, как задумано в макете.
+///
+/// Принимает: размер экрана в пикселях. Возвращает: 1.0, 1.25, 1.5 или 2.0.
+fn ui_scale(w: u32, h: u32) -> f32 {
+    let short = w.min(h * 16 / 9).min(h * 2);
+    match short {
+        0..=1999 => 1.0,
+        2000..=2399 => 1.25,
+        2400..=3199 => 1.5,
+        _ => 2.0,
+    }
+}
+
 /// Копирует повреждённые области заднего буфера в GOP framebuffer.
 fn present_gop(fb: &mut Framebuffer, back: &[u32], width: u32, damage: &[orbita_ui::Rect]) {
     let info = fb.info;
-    let stride_px = info.stride / 4;
+    let stride_px = info.stride; // UEFI GOP: шаг строки в пикселях
     for r in damage {
         let x0 = r.x.max(0.0) as usize;
         let y0 = r.y.max(0.0) as usize;
@@ -595,4 +705,94 @@ fn present_gop(fb: &mut Framebuffer, back: &[u32], width: u32, damage: &[orbita_
             }
         }
     }
+}
+
+// ------------------------------------------------------------------ заставка
+
+/// Загрузочная заставка в стиле дизайн-системы: тёмный `surface-base`,
+/// ambient-свечение, логотип Orbita, название, этап загрузки и полоса
+/// прогресса. Рисуется программно в UEFI GOP — до того, как поднимется
+/// virtio-gpu; перерисовываются только изменившиеся области.
+pub(crate) struct Splash {
+    painter: orbita_ui::gfx::Painter,
+    soft: SoftRenderer,
+    back: Vec<u32>,
+    base: *mut u8,
+    stride_px: usize,
+    w: u32,
+    h: u32,
+    progress: f32,
+    stage: String,
+}
+
+unsafe impl Send for Splash {}
+
+static SPLASH: spin::Mutex<Option<Splash>> = spin::Mutex::new(None);
+
+impl Splash {
+    fn draw(&mut self) {
+        use orbita_ui::gfx::Paint;
+        use orbita_ui::{Color, Rect, tokens};
+        let t = tokens::DARK;
+        let p = &mut self.painter;
+        p.begin_frame(self.w, self.h, 1.0, t.surface_base);
+        let s = p.screen;
+        // Тот же фон, что в первом кадре анимации загрузки оболочки
+        // (`shell::chrome::intro`), — переход GOP → GPU незаметен.
+        p.rect(s, 0.0, Paint::blob(0.5, 1.05, 0.7, 0.84, t.amb_blue.percent(0.6), 0.75));
+        p.rect(s, 0.0, Paint::blob(0.15, -0.05, 0.45, 0.54, t.amb_indigo.percent(0.4), 0.75));
+        p.noise(s, 0.0, 0.05);
+        let c = s.center();
+        // Тот же логотип, что в первом кадре анимации загрузки.
+        orbita_ui::shell::logo::draw(p, c, 128.0, &t, -0.45, 1.0);
+        let _ = Rect::ZERO;
+        let _ = (&self.stage, self.progress);
+        let _ = Color::WHITE;
+        p.end_frame();
+        let dmg = self.soft.render(p.frame(), &p.fonts.atlas, &mut self.back, self.w as usize);
+        for r in &dmg {
+            let x0 = r.x.max(0.0) as usize;
+            let x1 = (r.right() as usize).min(self.w as usize);
+            for y in (r.y.max(0.0) as usize)..(r.bottom() as usize).min(self.h as usize) {
+                let src = &self.back[y * self.w as usize + x0..y * self.w as usize + x1];
+                unsafe {
+                    let dst = (self.base as *mut u32).add(y * self.stride_px + x0);
+                    core::ptr::copy_nonoverlapping(src.as_ptr(), dst, x1 - x0);
+                }
+            }
+        }
+    }
+}
+
+/// Показывает заставку на GOP framebuffer (вызывается в начале загрузки).
+pub(crate) fn splash_begin(fb: &Framebuffer) {
+    let info = fb.info;
+    let (w, h) = (info.width as u32, info.height as u32);
+    let mut s = Splash {
+        painter: orbita_ui::gfx::Painter::new(),
+        soft: SoftRenderer::new(w, h),
+        back: vec![0u32; (w * h) as usize],
+        base: info.base,
+        stride_px: info.stride, // UEFI GOP: шаг строки в пикселях
+        w,
+        h,
+        progress: 0.02,
+        stage: String::from("Запуск ядра"),
+    };
+    s.draw();
+    *SPLASH.lock() = Some(s);
+}
+
+/// Обновляет этап и прогресс заставки (`0.0..=1.0`).
+pub(crate) fn splash_step(progress: f32, stage: &str) {
+    if let Some(s) = SPLASH.lock().as_mut() {
+        s.progress = progress.clamp(0.0, 1.0);
+        s.stage = String::from(stage);
+        s.draw();
+    }
+}
+
+/// Убирает заставку и освобождает её память.
+pub(crate) fn splash_end() {
+    *SPLASH.lock() = None;
 }

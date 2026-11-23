@@ -38,6 +38,7 @@ pub const VIRTIO_GPU_F_EDID: u64 = 1 << 1;
 
 const CMD_GET_DISPLAY_INFO: u32 = 0x0100;
 const CMD_RESOURCE_CREATE_2D: u32 = 0x0101;
+const CMD_RESOURCE_UNREF: u32 = 0x0102;
 const CMD_SET_SCANOUT: u32 = 0x0103;
 const CMD_RESOURCE_FLUSH: u32 = 0x0104;
 const CMD_TRANSFER_TO_HOST_2D: u32 = 0x0105;
@@ -331,6 +332,27 @@ impl VirtioGpu {
         hdr(&mut req, CMD_RESOURCE_FLUSH, 0, 0, 0);
         put(&mut req, &[0, 0, w, h, res, 0]);
         self.queue(req)
+    }
+
+    /// Удаляет ресурс (освобождает память на хосте).
+    pub fn resource_unref(&mut self, res: u32) -> Result<(), GpuError> {
+        let mut req = Vec::new();
+        hdr(&mut req, CMD_RESOURCE_UNREF, 0, 0, 0);
+        put(&mut req, &[res, 0]);
+        self.expect_ok(req)
+    }
+
+    /// Изменилась ли конфигурация дисплея (окно QEMU сменило размер).
+    ///
+    /// Читает `events_read` и подтверждает событие через `events_clear`.
+    pub fn display_changed(&mut self) -> bool {
+        const EVENT_DISPLAY: u32 = 1;
+        let ev = self.pci.device_cfg_u32(0);
+        if ev & EVENT_DISPLAY != 0 {
+            self.pci.set_device_cfg_u32(4, EVENT_DISPLAY);
+            return true;
+        }
+        false
     }
 
     /// Описание устройства для журнала.

@@ -14,6 +14,7 @@ pub mod ccmd {
     #![allow(missing_docs)]
     pub const CREATE_OBJECT: u32 = 1;
     pub const BIND_OBJECT: u32 = 2;
+    pub const DESTROY_OBJECT: u32 = 3;
     pub const SET_VIEWPORT_STATE: u32 = 4;
     pub const SET_FRAMEBUFFER_STATE: u32 = 5;
     pub const SET_VERTEX_BUFFERS: u32 = 6;
@@ -23,6 +24,7 @@ pub mod ccmd {
     pub const SET_INDEX_BUFFER: u32 = 11;
     pub const SET_CONSTANT_BUFFER: u32 = 12;
     pub const SET_SCISSOR_STATE: u32 = 15;
+    pub const RESOURCE_INLINE_WRITE: u32 = 9;
     pub const RESOURCE_COPY_REGION: u32 = 17;
     pub const BIND_SAMPLER_STATES: u32 = 18;
     pub const SET_SUB_CTX: u32 = 28;
@@ -174,6 +176,12 @@ impl Encoder {
     /// Привязывает объект состояния (blend/rasterizer/dsa/vertex elements).
     pub fn bind_object(&mut self, object: u32, handle: u32) {
         self.head(ccmd::BIND_OBJECT, object, 1);
+        self.buf.push(handle);
+    }
+
+    /// Удаляет объект (поверхность, представление текстуры и т.п.).
+    pub fn destroy_object(&mut self, object: u32, handle: u32) {
+        self.head(ccmd::DESTROY_OBJECT, object, 1);
         self.buf.push(handle);
     }
 
@@ -351,6 +359,27 @@ impl Encoder {
         self.buf.push(0); // min_index
         self.buf.push(0xffff_ffff); // max_index
         self.buf.push(0); // count_from_so
+    }
+
+    /// Записывает байты прямо в буфер-ресурс (данные внутри потока команд).
+    ///
+    /// Принимает: ресурс, смещение в байтах и данные (длина кратна 4).
+    /// Большие данные режутся на куски по 32 КиБ (длина команды — 16 бит).
+    pub fn inline_write(&mut self, res: u32, offset: u32, data: &[u8]) {
+        let mut at = 0usize;
+        while at < data.len() {
+            let n = (data.len() - at).min(32 * 1024);
+            let words = n.div_ceil(4);
+            self.head(ccmd::RESOURCE_INLINE_WRITE, 0, 11 + words as u32);
+            // res, level, usage, stride, layer_stride, x, y, z, w, h, d
+            self.buf.extend_from_slice(&[res, 0, 0, 0, 0, offset + at as u32, 0, 0, n as u32, 1, 1]);
+            for c in data[at..at + n].chunks(4) {
+                let mut b = [0u8; 4];
+                b[..c.len()].copy_from_slice(c);
+                self.buf.push(u32::from_le_bytes(b));
+            }
+            at += n;
+        }
     }
 
     /// Копирует область текстуры `src` в `dst` (уровень 0).

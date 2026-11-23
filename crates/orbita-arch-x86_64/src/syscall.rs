@@ -316,8 +316,12 @@ pub fn install_syscall_gate() {
     // SAFETY: MSR writes during early single-CPU boot; EFER is modified
     // read-modify-write to keep the NXE state `abi::disable_nx` left.
     unsafe {
-        msr::write(MSR_STAR, (crate::gdt::KERNEL_CODE_SELECTOR as u64) << 32
-            | (crate::gdt::USER_CODE32_SELECTOR as u64));
+        // STAR: [47:32] — CS ядра для SYSCALL, [63:48] — база селекторов
+        // SYSRET (user code32), [31:0] — EIP для 32-битного SYSCALL (0).
+        // Раньше селектор пользователя лежал в [31:0]: TCG это прощает,
+        // а Hyper-V (QEMU -accel whpx) отвечает #GP.
+        msr::write(MSR_STAR, ((crate::gdt::USER_CODE32_SELECTOR as u64) << 48)
+            | ((crate::gdt::KERNEL_CODE_SELECTOR as u64) << 32));
         msr::write(MSR_LSTAR, orbita_x86_64_syscall_entry as *const () as u64);
         msr::write(MSR_FMASK, SYSCALL_FLAG_MASK);
         let efer = msr::read(MSR_EFER);

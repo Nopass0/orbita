@@ -285,6 +285,7 @@ mod shell_port {
             let mut v: Vec<DirEntry> = listing
                 .entries
                 .into_iter()
+                .filter(|e| !e.name.starts_with('.'))
                 .map(|e| DirEntry {
                     is_dir: e.metadata.is_directory(),
                     size: e.metadata.size_bytes,

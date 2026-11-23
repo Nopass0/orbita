@@ -49,11 +49,11 @@ build:
         - "target/orbita-pkg/sysinfo.orbpkg"
 
     # 1 — compile the no_std UEFI kernel (cargo uses every host core).
-    - name: "1. kernel (x86_64-unknown-uefi, release)"
+    - name: "1. kernel (x86_64-orbita-uefi: UEFI + SSE2, release)"
       source: .
-      command: "cargo build --release -p orbita-kernel --target x86_64-unknown-uefi"
+      command: "cargo kernel"
       artifacts:
-        - "target/x86_64-unknown-uefi/release/orbita-kernel.efi"
+        - "target/x86_64-orbita-uefi/release/orbita-kernel.efi"
 
     # 2 — assemble the FAT ESP image QEMU boots from and publish the EFI
     #     binary into dist/ as the distributable artifact.

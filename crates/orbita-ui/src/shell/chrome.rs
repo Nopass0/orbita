@@ -209,7 +209,7 @@ pub fn topbar(d: &mut Desktop) {
         d.toggle_launcher();
     }
     let theme = d.ui.theme;
-    d.ui.p.icon(Icon::Logo, logo_r.center_box(28.0, 28.0), t.ink, &theme, 1.0);
+    super::logo::draw(&mut d.ui.p, logo_r.center(), 28.0, &theme, -0.45, 0.0);
     x += 36.0;
 
     // Имя активного приложения (полужирное) и меню.
@@ -797,6 +797,54 @@ pub fn toasts(d: &mut Desktop) {
         y += (h + 10.0) * a;
     }
     d.toasts.retain(|t| !expired.contains(t));
+}
+
+// ------------------------------------------------------------------ загрузчик
+
+/// Длительность анимации загрузки: заставка + растворение.
+pub const INTRO_HOLD: f64 = 1.4;
+/// Длительность растворения заставки в рабочий стол.
+pub const INTRO_FADE: f64 = 0.8;
+
+/// Анимированный загрузчик: логотип Orbita на плавно переплетающихся
+/// ambient-градиентах, затем растворение в рабочий стол.
+///
+/// Рисуется поверх всего (кроме курсора) в первые
+/// `INTRO_HOLD + INTRO_FADE` секунд после первого кадра. Первый кадр
+/// совпадает с ранней заставкой ядра (UEFI GOP), поэтому переход незаметен.
+pub fn intro(d: &mut Desktop) {
+    let Some(t0) = d.intro_start else { return };
+    let t = d.ui.now - t0;
+    if t >= INTRO_HOLD + INTRO_FADE {
+        d.intro_start = None;
+        return;
+    }
+    d.ui.anims.mark_active();
+    let screen = d.ui.screen();
+    let th = crate::tokens::DARK;
+    // Растворение: 1 → 0 по кривой --ob-ease-soft.
+    let fade = if t < INTRO_HOLD { 1.0 } else { 1.0 - crate::anim::Ease::Soft.apply(((t - INTRO_HOLD) / INTRO_FADE) as f32) };
+    d.ui.layer(90_000, if fade > 0.5 { screen } else { Rect::ZERO });
+    d.ui.p.push_opacity(fade);
+    d.ui.p.rect(screen, 0.0, Paint::Solid(th.surface_base));
+    // Четыре пятна медленно движутся по эллипсам с разными периодами.
+    let ph = t as f32;
+    let blob = |p: &mut crate::gfx::Painter, cx: f32, cy: f32, r: f32, c: Color, k: f32| {
+        p.rect(screen, 0.0, Paint::blob(cx, cy, r, r * 1.2, c.percent(k), 0.75));
+    };
+    blob(&mut d.ui.p, 0.5 + 0.18 * math::sin(ph * 0.9), 1.05 + 0.06 * math::cos(ph * 0.7), 0.7, th.amb_blue, 0.6);
+    blob(&mut d.ui.p, 0.15 + 0.08 * math::cos(ph * 0.6), -0.05 + 0.08 * math::sin(ph * 0.8), 0.45, th.amb_indigo, 0.4);
+    blob(&mut d.ui.p, 0.9 + 0.07 * math::sin(ph * 0.75 + 1.0), 0.25 + 0.1 * math::cos(ph * 0.5), 0.4, th.amb_cyan, 0.28 * math::min(1.0, ph));
+    blob(&mut d.ui.p, 0.1 + 0.06 * math::sin(ph * 0.55 + 2.0), 0.9 + 0.05 * math::cos(ph * 0.65), 0.35, th.amb_teal, 0.22 * math::min(1.0, ph));
+    d.ui.p.noise(screen, 0.0, 0.05);
+    // Логотип: лёгкое «дыхание», при растворении — увеличение.
+    let c = screen.center();
+    let breathe = 1.0 + 0.03 * math::sin(ph * 2.4);
+    let grow = 1.0 + 0.25 * (1.0 - fade);
+    // Спутник облетает планету — индикатор загрузки (≈1.6 с на круг).
+    let angle = -0.45 + ph * 3.9;
+    super::logo::draw(&mut d.ui.p, c, 128.0 * breathe * grow, &th, angle, 1.0);
+    d.ui.p.pop_opacity();
 }
 
 // ------------------------------------------------------------------ курсор

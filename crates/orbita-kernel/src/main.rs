@@ -158,7 +158,9 @@ fn kernel_main(boot_info: BootInfo) -> ! {
     let summary = BootSummary::from_boot_info(&boot_info);
     let mut framebuffer = Framebuffer::new(boot_info.framebuffer);
     platform::log_line("Orbita OS: drawing framebuffer scene");
-    draw_boot_scene(&mut framebuffer, &summary);
+    // Загрузочная заставка дизайн-системы Orbita (вместо старой сцены).
+    gui::splash_begin(&framebuffer);
+    let _ = &summary;
     platform::log_line("Orbita OS: framebuffer scene ready");
 
     let mut frame_allocator = BootstrapFrameAllocator::new(boot_info.memory_regions());
@@ -221,6 +223,7 @@ fn kernel_main(boot_info: BootInfo) -> ! {
         executor.completed_tasks()
     );
 
+    gui::splash_step(0.2, "Устройства PCI");
     let pci_inventory = PciInventory::scan();
     let gpu_identity = detect_primary_gpu(&pci_inventory);
     let pci_inventory_lines = build_pci_inventory_report(&pci_inventory, gpu_identity.as_deref());
@@ -269,6 +272,7 @@ fn kernel_main(boot_info: BootInfo) -> ! {
     );
 
     // --- Network stack: loopback + the live e1000 NIC (QEMU user-net). ---
+    gui::splash_step(0.35, "Сеть");
     let mut net_stack = NetworkStack::new();
     let mut live_nic = driver_manager
         .by_name_any("e1000")
@@ -619,6 +623,7 @@ fn kernel_main(boot_info: BootInfo) -> ! {
             }
         }
     }
+    gui::splash_step(0.55, "Файловая система");
     println!("Orbita OS: init persistent disk");
     match orbita_disk.and_then(init_persistent_disk) {
         Some((mut diskfs, mut disk, boots)) => {
@@ -653,8 +658,10 @@ fn kernel_main(boot_info: BootInfo) -> ! {
                     let mut extra = alloc::vec![(local_apic.physical_base, 0x1000), (0xFEC0_0000, 0x1000)];
                     for dev in pci_inventory.devices() {
                         for bar in dev.bars.iter().flatten() {
-                            if bar.base >= 0x1_0000_0000 && bar.size > 0 {
-                                extra.push((bar.base, bar.size));
+                            // Размер BAR инвентаризация не измеряет (size=0):
+                            // берём окно 2 МиБ — регистры virtio занимают 16 КиБ.
+                            if bar.base >= 0x1_0000_0000 {
+                                extra.push((bar.base, bar.size.max(0x20_0000)));
                             }
                         }
                     }
@@ -816,6 +823,7 @@ fn kernel_main(boot_info: BootInfo) -> ! {
         console.set_status("keyboard: ps/2 unavailable");
     }
 
+    gui::splash_step(0.8, "Оболочка");
     let shell_runtime = ShellRuntime::new();
     let mut shell_env = ShellEnvironment::new(ShellSystemInfo::new(
         "Orbita OS x86_64-uefi",
@@ -1070,6 +1078,22 @@ impl orbita_fs::diskfs::SectorDevice for AhciSectorDisk {
 
     fn write_sector(&mut self, lba: u32, data: &[u8; 512]) -> bool {
         self.inner.write_sectors(lba as u64, 1, data)
+    }
+
+    /// Пакетное чтение: до 8 секторов одной командой AHCI.
+    fn read_sectors(&mut self, lba: u32, out: &mut [u8]) -> bool {
+        let mut at = 0usize;
+        while at < out.len() {
+            let n = ((out.len() - at) / 512).min(8);
+            if n == 0 {
+                break;
+            }
+            if !self.inner.read_sectors(lba as u64 + (at / 512) as u64, n as u16, &mut out[at..at + n * 512]) {
+                return false;
+            }
+            at += n * 512;
+        }
+        true
     }
 }
 

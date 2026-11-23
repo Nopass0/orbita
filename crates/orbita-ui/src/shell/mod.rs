@@ -36,6 +36,7 @@ use crate::tokens::{self, AccentChoice, ThemeMode, motion, radius, text};
 use crate::ui::{CursorKind, Look, Ui, id, id2};
 
 pub mod chrome;
+pub mod logo;
 pub mod wallpaper;
 
 pub use wallpaper::Wallpaper;
@@ -233,6 +234,8 @@ pub struct Desktop {
     pub topbar_menu: Option<usize>,
     welcomed: bool,
     raise: Option<u64>,
+    /// Время старта анимации загрузки (`None` — загрузчик завершён).
+    pub intro_start: Option<f64>,
 }
 
 impl Desktop {
@@ -265,6 +268,7 @@ impl Desktop {
             topbar_menu: None,
             welcomed: false,
             raise: None,
+            intro_start: None,
         }
     }
 
@@ -417,6 +421,9 @@ impl Desktop {
 
         if !self.welcomed {
             self.welcomed = true;
+            if self.settings.look.animations {
+                self.intro_start = Some(self.ui.now);
+            }
             let info = self.sys.info();
             self.notify(Notice::new(
                 "Добро пожаловать",
@@ -451,6 +458,7 @@ impl Desktop {
         chrome::toasts(self);
         self.ui.draw_popup();
         self.ui.draw_tooltip();
+        chrome::intro(self);
 
         // 6. Запросы приложений.
         let reqs = core::mem::take(&mut self.requests);
@@ -636,15 +644,19 @@ impl Desktop {
         let cx = bar.right() - 8.0 - ctrl_w;
         let cy = bar.y + (bar.h - 30.0) * 0.5;
         let base = win_key(wid, 10);
-        if self.ui.icon_button(id2(base, 1), Rect::new(cx, cy, 36.0, 30.0), Icon::IMinus, false).clicked {
-            self.set_minimized(wid, true);
-        }
-        let max_icon = if maximized { Icon::IRestore } else { Icon::IMax };
-        if self.ui.icon_button(id2(base, 2), Rect::new(cx + 38.0, cy, 36.0, 30.0), max_icon, false).clicked {
-            self.toggle_maximize(wid);
-        }
-        if self.ui.icon_button(id2(base, 3), Rect::new(cx + 76.0, cy, 36.0, 30.0), Icon::IClose, true).clicked {
-            self.close(wid);
+        // В развёрнутом виде кнопки окна живут в верхней панели (макет
+        // FullscreenX) — в самом окне их не дублируем.
+        if max_t < 0.5 {
+            if self.ui.icon_button(id2(base, 1), Rect::new(cx, cy, 36.0, 30.0), Icon::IMinus, false).clicked {
+                self.set_minimized(wid, true);
+            }
+            let max_icon = if maximized { Icon::IRestore } else { Icon::IMax };
+            if self.ui.icon_button(id2(base, 2), Rect::new(cx + 38.0, cy, 36.0, 30.0), max_icon, false).clicked {
+                self.toggle_maximize(wid);
+            }
+            if self.ui.icon_button(id2(base, 3), Rect::new(cx + 76.0, cy, 36.0, 30.0), Icon::IClose, true).clicked {
+                self.close(wid);
+            }
         }
 
         // Содержимое строки заголовка от приложения (адресная строка).

@@ -49,6 +49,8 @@ pub struct ResourceDesc {
 pub trait GpuDevice {
     /// Создаёт ресурс и привязывает к 3D-контексту. Возвращает его id.
     fn create_resource(&mut self, desc: ResourceDesc) -> Result<u32, String>;
+    /// Удаляет ресурс (освобождает память на хосте).
+    fn destroy_resource(&mut self, res: u32) -> Result<(), String>;
     /// Подключает гостевую память как хранилище ресурса.
     fn attach_backing(&mut self, res: u32, addr: u64, len: u32) -> Result<(), String>;
     /// Ставит в очередь копирование области backing → GPU.
@@ -67,6 +69,10 @@ pub trait GpuDevice {
 pub const VERTEX_BYTES: usize = shaders::UI_ATTRS as usize * 16;
 /// Максимум примитивов за кадр.
 pub const MAX_INSTANCES: usize = 8192;
+/// Вершинных буферов в пуле (≈ 4900 примитивов за кадр).
+pub const VB_POOL: usize = 128;
+/// Примитивов в одной порции вершин (4 вершины × 208 байт ≤ 32 КиБ).
+pub const CHUNK_INSTANCES: usize = (32 * 1024) / (4 * VERTEX_BYTES);
 /// Сторона атласа спрайтов.
 pub const SPRITE_ATLAS: u32 = 2048;
 
@@ -162,6 +168,15 @@ fn hash_f32s(h: &mut u64, vals: &[f32]) {
     }
 }
 
+/// Ресурсы, зависящие от размера экрана.
+struct Targets {
+    scene: u32,
+    cap: u32,
+    pyr: [u32; 3],
+    wall_res: u32,
+    wall: Vec<u32>,
+}
+
 /// Статистика последнего кадра.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct GpuStats {
@@ -173,6 +188,12 @@ pub struct GpuStats {
     pub baked: usize,
     /// Байт вершин отправлено.
     pub vertex_bytes: usize,
+    /// Время растеризации обоев, мс (если задан `clock`).
+    pub wall_ms: f32,
+    /// Время запекания спрайтов, мс.
+    pub bake_ms: f32,
+    /// Время отправки и ожидания GPU, мс.
+    pub submit_ms: f32,
 }
 
 /// Рендерер интерфейса на GPU через virgl.
@@ -187,7 +208,8 @@ pub struct GpuRenderer {
     res_wall: u32,
     res_atlas: u32,
     res_sprites: u32,
-    res_vbuf: u32,
+    /// Пул вершинных буферов по 32 КиБ: каждая порция кадра — в свой буфер.
+    res_vbufs: Vec<u32>,
     res_ibuf: u32,
     res_blit: u32,
     vbuf: Vec<u8>,
@@ -201,6 +223,10 @@ pub struct GpuRenderer {
     insts: Vec<Instance>,
     /// Статистика последнего кадра.
     pub stats: GpuStats,
+    /// Снимать фон для стекла (выключено — стекло без размытия).
+    pub blur: bool,
+    /// Часы для замеров фаз кадра (секунды), необязательно.
+    pub clock: Option<fn() -> f64>,
 }
 
 fn map_err(e: String) -> String {
@@ -214,19 +240,21 @@ impl GpuRenderer {
     /// становится хранилищем текстуры атласа — без копий).
     pub fn new(dev: &mut dyn GpuDevice, w: u32, h: u32, atlas: &Atlas) -> Result<GpuRenderer, String> {
         let tex = |format, bind, w, h| ResourceDesc { target: 2, format, bind, width: w, height: h };
-        let rt = bind::RENDER_TARGET | bind::SAMPLER_VIEW;
-        let res_scene = dev.create_resource(tex(fmt::B8G8R8A8_UNORM, rt | bind::SCANOUT, w, h))?;
-        let res_cap = dev.create_resource(tex(fmt::B8G8R8A8_UNORM, rt, w, h))?;
-        let mut res_pyr = [0u32; 3];
-        for (i, r) in res_pyr.iter_mut().enumerate() {
-            let k = 2u32 << i;
-            *r = dev.create_resource(tex(fmt::B8G8R8A8_UNORM, rt, (w / k).max(1), (h / k).max(1)))?;
-        }
-        let res_wall = dev.create_resource(tex(fmt::B8G8R8A8_UNORM, bind::SAMPLER_VIEW, w, h))?;
+        let t = Self::create_targets(dev, w, h)?;
+        let (res_scene, res_cap, res_pyr, res_wall, wall) = (t.scene, t.cap, t.pyr, t.wall_res, t.wall);
         let res_atlas = dev.create_resource(tex(fmt::R8_UNORM, bind::SAMPLER_VIEW, ATLAS_SIZE, ATLAS_SIZE))?;
         let res_sprites = dev.create_resource(tex(fmt::B8G8R8A8_UNORM, bind::SAMPLER_VIEW, SPRITE_ATLAS, SPRITE_ATLAS))?;
         let vbytes = MAX_INSTANCES * 4 * VERTEX_BYTES;
-        let res_vbuf = dev.create_resource(ResourceDesc { target: 0, format: fmt::R8_UNORM, bind: bind::VERTEX_BUFFER, width: vbytes as u32, height: 1 })?;
+        let mut res_vbufs = Vec::with_capacity(VB_POOL);
+        for _ in 0..VB_POOL {
+            res_vbufs.push(dev.create_resource(ResourceDesc {
+                target: 0,
+                format: fmt::R8_UNORM,
+                bind: bind::VERTEX_BUFFER,
+                width: (CHUNK_INSTANCES * 4 * VERTEX_BYTES) as u32,
+                height: 1,
+            })?);
+        }
         let ibytes = MAX_INSTANCES * 6 * 4;
         let res_ibuf = dev.create_resource(ResourceDesc { target: 0, format: fmt::R8_UNORM, bind: bind::INDEX_BUFFER, width: ibytes as u32, height: 1 })?;
         let res_blit = dev.create_resource(ResourceDesc { target: 0, format: fmt::R8_UNORM, bind: bind::VERTEX_BUFFER, width: 96, height: 1 })?;
@@ -238,22 +266,18 @@ impl GpuRenderer {
             ibuf[i * 6..i * 6 + 6].copy_from_slice(&[b, b + 1, b + 2, b + 2, b + 1, b + 3]);
         }
         // Полноэкранный квад: (ndc.x, ndc.y, u, v).
+        // NDC y=-1 соответствует строке 0 текстуры (v=0) — как и в UI-проходе.
         let blit = vec![
-            -1.0, -1.0, 0.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 0.0, 0.0, //
-            -1.0, 1.0, 0.0, 0.0, 1.0, -1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0f32,
+            -1.0, -1.0, 0.0, 0.0, 1.0, -1.0, 1.0, 0.0, -1.0, 1.0, 0.0, 1.0, //
+            -1.0, 1.0, 0.0, 1.0, 1.0, -1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0f32,
         ];
-        let wall = vec![0u32; (w * h) as usize];
         let sprites = Sprites::new();
-        dev.attach_backing(res_vbuf, vbuf.as_ptr() as u64, vbuf.len() as u32)?;
         dev.attach_backing(res_ibuf, ibuf.as_ptr() as u64, (ibuf.len() * 4) as u32)?;
         dev.attach_backing(res_blit, blit.as_ptr() as u64, 96)?;
-        dev.attach_backing(res_wall, wall.as_ptr() as u64, (wall.len() * 4) as u32)?;
         dev.attach_backing(res_atlas, atlas.pixels.as_ptr() as u64, atlas.pixels.len() as u32)?;
         dev.attach_backing(res_sprites, sprites.pixels.as_ptr() as u64, (sprites.pixels.len() * 4) as u32)?;
         dev.upload(res_ibuf, 0, 0, (ibuf.len() * 4) as u32, 1, 0, 0)?;
         dev.upload(res_blit, 0, 0, 96, 1, 0, 0)?;
-        dev.set_scanout(res_scene, w, h)?;
-
         let mut e = Encoder::new();
         e.blend_premultiplied(H_BLEND);
         e.blend_opaque(H_BLEND_COPY);
@@ -265,15 +289,9 @@ impl GpuRenderer {
         e.shader(H_FS_UI, SHADER_FRAGMENT, &shaders::ui_fragment());
         e.shader(H_VS_BLIT, SHADER_VERTEX, &shaders::blit_vertex());
         e.shader(H_FS_DOWN, SHADER_FRAGMENT, &shaders::downsample_fragment());
-        e.surface(H_SURF_SCENE, res_scene, fmt::B8G8R8A8_UNORM);
-        for i in 0..3 {
-            e.surface(H_SURF_PYR + i as u32, res_pyr[i], fmt::B8G8R8A8_UNORM);
-            e.sampler_view(H_VIEW_PYR + i as u32, res_pyr[i], fmt::B8G8R8A8_UNORM);
-        }
+        Self::encode_target_objects(&mut e, res_scene, res_cap, res_pyr, res_wall);
         e.sampler_view(H_VIEW_ATLAS, res_atlas, fmt::R8_UNORM);
         e.sampler_view(H_VIEW_SPRITES, res_sprites, fmt::B8G8R8A8_UNORM);
-        e.sampler_view(H_VIEW_WALL, res_wall, fmt::B8G8R8A8_UNORM);
-        e.sampler_view(H_VIEW_CAP, res_cap, fmt::B8G8R8A8_UNORM);
         e.sampler_state(H_SAMP_LINEAR, true);
         e.bind_object(obj::RASTERIZER, H_RAST);
         e.bind_object(obj::DSA, H_DSA);
@@ -282,6 +300,7 @@ impl GpuRenderer {
         e.clear_color([0.12, 0.12, 0.12, 1.0]);
         dev.submit(&e.buf)?;
         dev.finish().map_err(map_err)?;
+        dev.set_scanout(res_scene, w, h)?;
 
         Ok(GpuRenderer {
             w,
@@ -292,7 +311,7 @@ impl GpuRenderer {
             res_wall,
             res_atlas,
             res_sprites,
-            res_vbuf,
+            res_vbufs,
             res_ibuf,
             res_blit,
             vbuf,
@@ -305,7 +324,72 @@ impl GpuRenderer {
             enc: Encoder::new(),
             insts: Vec::new(),
             stats: GpuStats::default(),
+            blur: true,
+            clock: None,
         })
+    }
+
+    /// Создаёт ресурсы, зависящие от размера экрана: сцену (scanout),
+    /// копию для стекла, пирамиду 1/2·1/4·1/8 и текстуру обоев.
+    fn create_targets(dev: &mut dyn GpuDevice, w: u32, h: u32) -> Result<Targets, String> {
+        let tex = |format, bind, w, h| ResourceDesc { target: 2, format, bind, width: w, height: h };
+        let rt = bind::RENDER_TARGET | bind::SAMPLER_VIEW;
+        let scene = dev.create_resource(tex(fmt::B8G8R8A8_UNORM, rt | bind::SCANOUT, w, h))?;
+        let cap = dev.create_resource(tex(fmt::B8G8R8A8_UNORM, rt, w, h))?;
+        let mut pyr = [0u32; 3];
+        for (i, r) in pyr.iter_mut().enumerate() {
+            let k = 2u32 << i;
+            *r = dev.create_resource(tex(fmt::B8G8R8A8_UNORM, rt, (w / k).max(1), (h / k).max(1)))?;
+        }
+        let wall_res = dev.create_resource(tex(fmt::B8G8R8A8_UNORM, bind::SAMPLER_VIEW, w, h))?;
+        let wall = vec![0u32; (w * h) as usize];
+        dev.attach_backing(wall_res, wall.as_ptr() as u64, (wall.len() * 4) as u32)?;
+        Ok(Targets { scene, cap, pyr, wall_res, wall })
+    }
+
+    /// Поверхности и представления для ресурсов-целей.
+    fn encode_target_objects(e: &mut Encoder, scene: u32, cap: u32, pyr: [u32; 3], wall: u32) {
+        e.surface(H_SURF_SCENE, scene, fmt::B8G8R8A8_UNORM);
+        for i in 0..3 {
+            e.surface(H_SURF_PYR + i as u32, pyr[i], fmt::B8G8R8A8_UNORM);
+            e.sampler_view(H_VIEW_PYR + i as u32, pyr[i], fmt::B8G8R8A8_UNORM);
+        }
+        e.sampler_view(H_VIEW_WALL, wall, fmt::B8G8R8A8_UNORM);
+        e.sampler_view(H_VIEW_CAP, cap, fmt::B8G8R8A8_UNORM);
+    }
+
+    /// Меняет разрешение: пересоздаёт цели рендера и назначает новый scanout.
+    ///
+    /// Вызывается, когда окно QEMU (или монитор) сменило размер.
+    pub fn resize(&mut self, dev: &mut dyn GpuDevice, w: u32, h: u32) -> Result<(), String> {
+        if (w, h) == (self.w, self.h) || w == 0 || h == 0 {
+            return Ok(());
+        }
+        let t = Self::create_targets(dev, w, h)?;
+        let mut e = Encoder::new();
+        e.destroy_object(obj::SURFACE, H_SURF_SCENE);
+        for i in 0..3 {
+            e.destroy_object(obj::SURFACE, H_SURF_PYR + i);
+            e.destroy_object(obj::SAMPLER_VIEW, H_VIEW_PYR + i);
+        }
+        e.destroy_object(obj::SAMPLER_VIEW, H_VIEW_WALL);
+        e.destroy_object(obj::SAMPLER_VIEW, H_VIEW_CAP);
+        Self::encode_target_objects(&mut e, t.scene, t.cap, t.pyr, t.wall_res);
+        dev.submit(&e.buf)?;
+        dev.finish()?;
+        dev.set_scanout(t.scene, w, h)?;
+        for old in [self.res_scene, self.res_cap, self.res_pyr[0], self.res_pyr[1], self.res_pyr[2], self.res_wall] {
+            let _ = dev.destroy_resource(old);
+        }
+        self.res_scene = t.scene;
+        self.res_cap = t.cap;
+        self.res_pyr = t.pyr;
+        self.res_wall = t.wall_res;
+        self.wall = t.wall;
+        self.wall_key = 0;
+        self.w = w;
+        self.h = h;
+        Ok(())
     }
 
     /// Размер экрана.
@@ -323,11 +407,10 @@ impl GpuRenderer {
         e.bind_object(obj::VERTEX_ELEMENTS, H_VE_UI);
         e.bind_shader(H_VS_UI, SHADER_VERTEX);
         e.bind_shader(H_FS_UI, SHADER_FRAGMENT);
-        e.vertex_buffer(VERTEX_BYTES as u32, 0, self.res_vbuf);
         e.index_buffer(self.res_ibuf);
         e.set_sampler_views(SHADER_FRAGMENT, 0, &[H_VIEW_ATLAS, H_VIEW_SPRITES, H_VIEW_PYR + 2, H_VIEW_WALL]);
         e.bind_sampler_states(SHADER_FRAGMENT, 0, &[H_SAMP_LINEAR; 4]);
-        e.constants(SHADER_VERTEX, &[2.0 / w, -2.0 / h, -1.0, 1.0]);
+        e.constants(SHADER_VERTEX, &[2.0 / w, 2.0 / h, -1.0, -1.0]);
         e.constants(SHADER_FRAGMENT, &[1.0 / w, 1.0 / h, 8.0 / w, 8.0 / h]);
     }
 
@@ -466,6 +549,9 @@ impl GpuRenderer {
     /// Принимает: устройство, кадр и атлас глифов, на который ссылается кадр.
     pub fn render(&mut self, dev: &mut dyn GpuDevice, frame: &Frame, atlas: &mut Atlas) -> Result<(), String> {
         self.stats = GpuStats::default();
+        let clk = self.clock;
+        let t = || clk.map(|f| f()).unwrap_or(0.0);
+        let t_wall = t();
         let full = [0.0, 0.0, self.w as f32, self.h as f32];
 
         // 1. Статичный пакет (обои) → текстура, только при смене ключа.
@@ -481,6 +567,7 @@ impl GpuRenderer {
                 break;
             }
         }
+        self.stats.wall_ms = ((t() - t_wall) * 1000.0) as f32;
 
         // 2. Атлас глифов: только грязная область.
         let gen_changed = atlas.generation != self.atlas_gen;
@@ -495,6 +582,7 @@ impl GpuRenderer {
         // 3. Список примитивов для GPU (пути → спрайты, обои → картинка).
         let mut insts = core::mem::take(&mut self.insts);
         insts.clear();
+        let t_bake = t();
         let mut ranges: Vec<(usize, usize, bool)> = Vec::with_capacity(frame.batches.len() + 1);
         for b in &frame.batches {
             let start = insts.len();
@@ -524,6 +612,7 @@ impl GpuRenderer {
             ranges.push((start, insts.len(), b.capture != 0));
         }
         let _ = skip;
+        self.stats.bake_ms = ((t() - t_bake) * 1000.0) as f32;
         if let Some(d) = self.sprites.dirty.take() {
             dev.upload(self.res_sprites, d[0], d[1], d[2] - d[0], d[3] - d[1], ((d[1] * SPRITE_ATLAS + d[0]) * 4) as u64, SPRITE_ATLAS * 4)?;
         }
@@ -557,9 +646,6 @@ impl GpuRenderer {
                 off += VERTEX_BYTES;
             }
         }
-        if off > 0 {
-            dev.upload(self.res_vbuf, 0, 0, off as u32, 1, 0, 0)?;
-        }
         self.stats.instances = n;
         self.stats.vertex_bytes = off;
 
@@ -567,20 +653,40 @@ impl GpuRenderer {
         self.enc.clear();
         self.ui_state();
         self.enc.clear_color(frame.clear);
+        let mut chunk = 0usize;
         for (start, end, capture) in ranges {
-            if capture {
+            if capture && self.blur {
                 self.capture();
                 self.ui_state();
             }
-            if end > start {
-                self.enc.draw((start * 6) as u32, ((end - start) * 6) as u32, true);
+            // Вершины — прямо в потоке команд (RESOURCE_INLINE_WRITE) порциями
+            // по 32 КиБ в начало буфера: под QEMU/Windows до GPU доходят только
+            // первые 32 КиБ вершинного буфера (проверено снимками экрана).
+            // Команды исполняются по порядку, поэтому «запись → draw»
+            // порциями даёт любое число примитивов в кадре.
+            let mut at = start;
+            while at < end {
+                let k = (end - at).min(CHUNK_INSTANCES);
+                if chunk >= self.res_vbufs.len() {
+                    break; // кадр больше пула — остаток не рисуем
+                }
+                let vb = self.res_vbufs[chunk];
+                chunk += 1;
+                let bytes = &self.vbuf[at * 4 * VERTEX_BYTES..(at + k) * 4 * VERTEX_BYTES];
+                self.enc.inline_write(vb, 0, bytes);
+                self.enc.vertex_buffer(VERTEX_BYTES as u32, 0, vb);
+                self.enc.draw(0, (k * 6) as u32, true);
+                at += k;
             }
         }
+        let t_sub = t();
         dev.submit(&self.enc.buf)?;
         dev.present(self.res_scene, self.w, self.h)?;
         self.insts = insts;
         let _ = (&self.ibuf, &self.blit, self.res_cap);
-        dev.finish()
+        let r = dev.finish();
+        self.stats.submit_ms = ((t() - t_sub) * 1000.0) as f32;
+        r
     }
 }
 
@@ -602,6 +708,9 @@ mod tests {
         fn create_resource(&mut self, _d: ResourceDesc) -> Result<u32, String> {
             self.next += 1;
             Ok(self.next)
+        }
+        fn destroy_resource(&mut self, _r: u32) -> Result<(), String> {
+            Ok(())
         }
         fn attach_backing(&mut self, _r: u32, addr: u64, len: u32) -> Result<(), String> {
             assert!(addr != 0 && len > 0);

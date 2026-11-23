@@ -176,7 +176,9 @@ impl VirtioPci {
         let mut spins = 0;
         while self.r8(C_STATUS) != 0 && spins < 1_000_000 {
             spins += 1;
-            core::hint::spin_loop();
+            for _ in 0..200 {
+                core::hint::spin_loop(); // не душим QEMU опросом MMIO
+            }
         }
         self.w8(C_STATUS, STATUS_ACKNOWLEDGE);
         self.w8(C_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);

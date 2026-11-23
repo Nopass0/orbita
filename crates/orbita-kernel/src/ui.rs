@@ -189,6 +189,8 @@ pub(crate) fn draw_desktop_ui(
     renderer.render(compositor, &scene, frame_counter, scope);
 }
 
+/// Прежняя загрузочная сцена (режим `ui=classic`); новая — `gui::splash_begin`.
+#[allow(dead_code)]
 pub(crate) fn draw_boot_scene(framebuffer: &mut Framebuffer, summary: &BootSummary) {
     let renderer = DesktopRenderer::new();
     let memory_text = format!("{}", diagnostics::format_bytes(summary.usable_memory_bytes));

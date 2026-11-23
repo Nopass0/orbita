@@ -20,21 +20,22 @@ jobs:
         run: cargo test --workspace --exclude orbita-kernel
 
   kernel-build:
-    name: Kernel (x86_64-unknown-uefi)
+    name: Kernel (x86_64-orbita-uefi)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
         with:
           targets: x86_64-unknown-uefi
+          components: rust-src
       - name: Build kernel (release, warnings denied)
         env:
           RUSTFLAGS: -D warnings
-        run: cargo build --release -p orbita-kernel --target x86_64-unknown-uefi
+        run: cargo kernel
       - uses: actions/upload-artifact@v4
         with:
           name: orbita-kernel-efi
-          path: target/x86_64-unknown-uefi/release/orbita-kernel.efi
+          path: target/x86_64-orbita-uefi/release/orbita-kernel.efi
 
   apps-build:
     name: Applications (x86_64-unknown-none + delivery image)

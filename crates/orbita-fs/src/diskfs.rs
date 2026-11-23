@@ -32,7 +32,8 @@ const INODES_PER_SECTOR: usize = SECTOR / INODE_SIZE;
 const MAGIC: [u8; 8] = *b"ORBFS1\0\0";
 
 /// Maximum number of inodes (fills 32 sectors).
-pub const MAX_INODES: usize = 128;
+/// Число инодов (файлов и каталогов) на томе.
+pub const MAX_INODES: usize = 4096;
 
 /// On-disk superblock (sector 0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +98,20 @@ impl Inode {
 pub trait SectorDevice {
     fn read_sector(&mut self, lba: u32, out: &mut [u8; SECTOR]) -> bool;
     fn write_sector(&mut self, lba: u32, data: &[u8; SECTOR]) -> bool;
+
+    /// Читает подряд `out.len() / 512` секторов. Устройства с пакетным
+    /// вводом-выводом (AHCI) переопределяют — монтирование большого тома
+    /// идёт в разы быстрее.
+    fn read_sectors(&mut self, lba: u32, out: &mut [u8]) -> bool {
+        for (i, chunk) in out.chunks_exact_mut(SECTOR).enumerate() {
+            let mut s = [0u8; SECTOR];
+            if !self.read_sector(lba + i as u32, &mut s) {
+                return false;
+            }
+            chunk.copy_from_slice(&s);
+        }
+        true
+    }
 }
 
 /// A mounted OrbitaFS volume.
@@ -109,6 +124,9 @@ pub struct OrbitaDiskFs {
     bitmap_sector: u32,
     inodes: Vec<Inode>,
     bitmap: Vec<u8>,
+    /// Копия битовой карты в том виде, как она лежит на диске: при
+    /// сохранении пишутся только изменившиеся секторы.
+    bitmap_disk: Vec<u8>,
 }
 
 /// Why a mount failed.
@@ -128,7 +146,8 @@ impl OrbitaDiskFs {
         let bitmap_sector = 1u32;
         let bitmap_sectors = bitmap_sectors_for(total_blocks);
         let inode_table_sector = 1 + bitmap_sectors;
-        let inode_sectors = (MAX_INODES / INODES_PER_SECTOR) as u32;
+        let inode_count = inodes_for(total_blocks);
+        let inode_sectors = (inode_count / INODES_PER_SECTOR) as u32;
         let data_start_block = 1 + bitmap_sectors + inode_sectors;
 
         // Empty bitmap: everything before data_start is used, rest free.
@@ -166,7 +185,7 @@ impl OrbitaDiskFs {
             magic: MAGIC,
             version: 1,
             total_blocks,
-            inode_count: MAX_INODES as u32,
+            inode_count: inode_count as u32,
             bitmap_sector,
             inode_table_sector,
             data_start_block,
@@ -196,18 +215,14 @@ impl OrbitaDiskFs {
         // Bitmap.
         let bitmap_sectors = bitmap_sectors_for(sb.total_blocks);
         let mut bitmap = vec![0u8; bitmap_sectors as usize * SECTOR];
-        for index in 0..bitmap_sectors {
-            let mut chunk = [0u8; SECTOR];
-            if !device.read_sector(sb.bitmap_sector + index, &mut chunk) {
-                return Err(MountError::IoFailure);
-            }
-            bitmap[index as usize * SECTOR..(index as usize + 1) * SECTOR]
-                .copy_from_slice(&chunk);
+        if !device.read_sectors(sb.bitmap_sector, &mut bitmap) {
+            return Err(MountError::IoFailure);
         }
 
         // Inode table.
         let mut inodes = Vec::new();
-        for index in 0..(MAX_INODES / INODES_PER_SECTOR) {
+        let inode_count = (sb.inode_count as usize).clamp(INODES_PER_SECTOR, MAX_INODES);
+        for index in 0..(inode_count / INODES_PER_SECTOR) {
             let mut chunk = [0u8; SECTOR];
             if !device.read_sector(sb.inode_table_sector + index as u32, &mut chunk) {
                 return Err(MountError::IoFailure);
@@ -225,6 +240,7 @@ impl OrbitaDiskFs {
             inode_table_sector: sb.inode_table_sector,
             bitmap_sector: sb.bitmap_sector,
             inodes,
+            bitmap_disk: bitmap.clone(),
             bitmap,
         })
     }
@@ -541,14 +557,24 @@ impl OrbitaDiskFs {
         }
     }
 
-    fn flush_bitmap<D: SectorDevice>(&self, device: &mut D) -> bool {
+    /// Сохраняет битовую карту: только секторы, отличающиеся от диска.
+    ///
+    /// На томе 10 ГБ карта — 5120 секторов; раньше она переписывалась
+    /// целиком при каждом изменении файла (минуты на загрузке), теперь —
+    /// обычно 1–2 сектора.
+    fn flush_bitmap<D: SectorDevice>(&mut self, device: &mut D) -> bool {
         let sectors = self.bitmap.len() / SECTOR;
         for index in 0..sectors {
+            let range = index * SECTOR..(index + 1) * SECTOR;
+            if self.bitmap[range.clone()] == self.bitmap_disk[range.clone()] {
+                continue;
+            }
             let mut chunk = [0u8; SECTOR];
-            chunk.copy_from_slice(&self.bitmap[index * SECTOR..(index + 1) * SECTOR]);
+            chunk.copy_from_slice(&self.bitmap[range.clone()]);
             if !device.write_sector(self.bitmap_sector + index as u32, &chunk) {
                 return false;
             }
+            self.bitmap_disk[range].copy_from_slice(&chunk);
         }
         true
     }
@@ -566,6 +592,17 @@ impl OrbitaDiskFs {
             .copy_from_slice(&bytes);
         device.write_sector(self.inode_table_sector + sector_index as u32, &chunk)
     }
+}
+
+/// Число инодов для тома: 1 на 64 блока, от 128 до [`MAX_INODES`].
+///
+/// ```
+/// assert_eq!(orbita_fs::diskfs::inodes_for(1024), 128);
+/// assert_eq!(orbita_fs::diskfs::inodes_for(20_971_520), orbita_fs::diskfs::MAX_INODES);
+/// ```
+pub fn inodes_for(total_blocks: u32) -> usize {
+    let n = (total_blocks as usize / 64).clamp(128, MAX_INODES);
+    n / INODES_PER_SECTOR * INODES_PER_SECTOR
 }
 
 fn bitmap_sectors_for(total_blocks: u32) -> u32 {
